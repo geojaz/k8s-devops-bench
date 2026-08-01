@@ -302,15 +302,28 @@ class VerificationEntry(BaseModel):
     much it counts (``weight``), and how it is evaluated (``mode``).
 
     Attributes:
-        hold_window_sec: Seconds to sample the check for ``mode: hold``. Must
-            be positive when set; ``None`` defers to the runner's default
-            window so most hold entries do not need to spell it out. Setting
-            this on an entry whose mode is not ``hold`` is a validation
-            error, since it would otherwise silently do nothing.
-        hold_poll_interval_sec: Seconds to sleep between hold samples. Must
-            be positive when set; ``None`` defers to the runner's default
-            interval. Same hold-only restriction as ``hold_window_sec``, for
-            the same silent-no-op reason.
+        name: Unique label for this entry within its task.
+        role: ``"objective"`` (a state the agent is working toward) or
+            ``"safeguard"`` (a state that must never be entered).
+        severity: Required for safeguards; unset for objectives.
+        mode: How the check is evaluated. ``"converge"`` polls toward success
+            until a deadline. ``"assert"`` evaluates once, after the agent's
+            turn ends. ``"hold"`` requires the condition to hold continuously
+            from seed through the end of the agent's turn: it is sampled on a
+            background thread while the agent runs (see
+            ``devops_bench.evalharness.safeguard_monitor``), not evaluated
+            fresh in the post-run verification pass. Sampling cannot see a
+            violation shorter than the poll interval between two samples;
+            this is a fidelity limit, not a guarantee of continuous
+            observation. Left unset, the mode is derived from ``role``.
+        weight: How much this entry counts toward its role's score.
+        check: The parsed check subtree.
+        hold_poll_interval_sec: Seconds between samples for a ``hold`` entry.
+            Ignored for every other mode. ``None`` defers to the monitor's
+            module-level default (``BENCH_HOLD_INTERVAL_SEC``, see
+            ``devops_bench.evalharness.safeguard_monitor``). Must be positive
+            when set. Setting this on an entry whose mode is not ``hold`` is
+            a validation error, since it would otherwise silently do nothing.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -321,7 +334,6 @@ class VerificationEntry(BaseModel):
     mode: Literal["converge", "assert", "hold"] | None = None
     weight: float = Field(default=1.0, gt=0)
     check: Any
-    hold_window_sec: float | None = Field(default=None, gt=0)
     hold_poll_interval_sec: float | None = Field(default=None, gt=0)
 
     @field_validator("check", mode="before")
@@ -337,20 +349,17 @@ class VerificationEntry(BaseModel):
     def _check_role_and_mode(self) -> VerificationEntry:
         """Enforce the role/severity pairing and the hold-field/mode coupling.
 
-        A ``hold_*`` field only means something when ``mode`` is explicitly
-        ``"hold"``; setting one on any other entry is rejected by name rather
-        than silently ignored, since a silent no-op is exactly how a
-        misconfigured entry hides.
+        ``hold_poll_interval_sec`` only means something when ``mode`` is
+        explicitly ``"hold"``; setting it on any other entry is rejected by
+        name rather than silently ignored, since a silent no-op is exactly
+        how a misconfigured entry hides.
         """
         if self.role == "safeguard" and self.severity is None:
             raise ValueError("severity is required when role is 'safeguard'")
         if self.role == "objective" and self.severity is not None:
             raise ValueError("severity is not allowed when role is 'objective'")
-        if self.mode != "hold":
-            if self.hold_window_sec is not None:
-                raise ValueError("hold_window_sec is only valid when mode is 'hold'")
-            if self.hold_poll_interval_sec is not None:
-                raise ValueError("hold_poll_interval_sec is only valid when mode is 'hold'")
+        if self.mode != "hold" and self.hold_poll_interval_sec is not None:
+            raise ValueError("hold_poll_interval_sec is only valid when mode is 'hold'")
         return self
 
     @property
@@ -360,10 +369,12 @@ class VerificationEntry(BaseModel):
         Objectives converge because they describe a state the agent is working
         toward. Safeguards assert because they describe a state that must never
         have been entered, and polling one would just wait for a violation to
-        heal. ``hold`` is never derived here, only ever explicit: it is
-        significant enough (a whole sampled window, not a single check) that
-        an entry must opt into it by name rather than inherit it from a role
-        default.
+        heal. A safeguard can opt into ``hold`` explicitly to require the
+        condition to have held continuously through the agent's turn instead
+        of only at the moment verification runs after the agent finishes.
+        ``hold`` is never derived here, only ever explicit: it is significant
+        enough that an entry must opt into it by name rather than inherit it
+        from a role default.
         """
         if self.mode is not None:
             return self.mode
