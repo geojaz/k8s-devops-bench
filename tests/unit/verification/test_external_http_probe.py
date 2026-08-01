@@ -258,7 +258,7 @@ def test_name_based_lookup(mocker: MockerFixture) -> None:
     result = v.verify(0)
     assert result.success is True
     get_resource.assert_called_once_with(
-        "service", "hello-app", namespace=None, kubeconfig=None, timeout=15
+        "service", "hello-app", namespace=None, kubeconfig=None, context=None, timeout=15
     )
 
 

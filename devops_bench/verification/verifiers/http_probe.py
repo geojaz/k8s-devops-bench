@@ -113,12 +113,18 @@ class HttpProbeVerifier(BaseVerifier):
         # a converge-mode retry needs a bound tight to this one attempt so the
         # next attempt fires promptly, not single_call_timeout's near-zero floor
         # meant only to protect an assert-mode call with no real budget.
+        #
+        # kubeconfig and context are both pinned to the run's cluster: the
+        # ambient current-context is a mutable global any run can rewrite, and
+        # an in-cluster probe pod has to launch against the cluster under
+        # test, not whichever one happens to be ambient.
         output = run_pod(
             pod_name,
             "curlimages/curl",
             curl_cmd,
             namespace=self.namespace,
             kubeconfig=self.kubeconfig,
+            context=self.context,
             timeout=self.probe_timeout + _KUBECTL_OVERHEAD_SEC,
         ).rstrip()
 
