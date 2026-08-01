@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from collections.abc import Mapping, Sequence
+from typing import IO
 
 from devops_bench.core.errors import SubprocessError
 from devops_bench.core.logging import get_logger
@@ -53,6 +55,7 @@ def run(
     text: bool = True,
     timeout: float | None = None,
     input: str | None = None,
+    stream: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command and return the completed process.
 
@@ -66,15 +69,33 @@ def run(
         text: Decode output as text.
         timeout: Seconds before terminating the command.
         input: Data written to stdin.
+        stream: Log stdout and stderr line-by-line as they arrive, while still
+            returning the full captured text. Without this a long-running child
+            is completely opaque until it exits, so an agent that wedges is
+            indistinguishable from one that is working. Requires ``text``.
 
     Returns:
         The completed process.
 
     Raises:
         SubprocessError: If the command exits non-zero (when ``check``) or times out.
+        ValueError: If ``stream`` is set without ``text``.
     """
     rendered = " ".join(str(arg) for arg in cmd)
     _log.debug("running command: %s (cwd=%s)", rendered, cwd or os.getcwd())
+
+    if stream:
+        if not text:
+            raise ValueError("stream=True requires text=True")
+        return _run_streamed(
+            cmd,
+            rendered=rendered,
+            cwd=cwd,
+            env=_build_env(env, extra_env),
+            check=check,
+            timeout=timeout,
+            input=input,
+        )
 
     try:
         completed = subprocess.run(
@@ -85,18 +106,9 @@ def run(
             text=text,
             timeout=timeout,
             input=input,
-            # DEVNULL, not the default of None. `None` makes the child INHERIT this
-            # process's stdin, which in an interactive run is the operator's terminal.
-            # `capture_output` only redirects stdout and stderr, so it does not help.
-            #
-            # A CLI subprocess that finds an open, non-TTY stdin can block reading it
-            # indefinitely. Observed with an agent CLI that printed a terminal-
-            # capability warning and then hung until the run's timeout killed it,
-            # producing no output and looking exactly like a slow network call. No
-            # subprocess this harness launches has any reason to read the operator's
-            # keyboard, so close the channel here rather than rely on every child to.
-            #
-            # `input=` manages stdin itself, so only override when there is none.
+            # Same reasoning as _run_streamed: never let a child inherit the
+            # operator's terminal as stdin. `input=` manages stdin itself, so only
+            # override when there is none.
             stdin=subprocess.DEVNULL if input is None else None,
             check=False,
         )
@@ -119,6 +131,107 @@ def run(
         )
 
     return completed
+
+
+def _pump(pipe: IO[str] | None, name: str, sink: list[str]) -> None:
+    """Drain one pipe, logging every line as it arrives and buffering it for the caller.
+
+    Reading both pipes on their own threads is what keeps this from deadlocking: a
+    child that fills its stderr buffer while the parent is blocked reading stdout
+    stops making progress, which is a hang with no diagnostic at all.
+    """
+    if pipe is None:
+        return
+    with pipe:
+        for line in pipe:
+            sink.append(line)
+            _log.debug("[%s] %s", name, line.rstrip("\n"))
+
+
+def _run_streamed(
+    cmd: Sequence[str | os.PathLike[str]],
+    *,
+    rendered: str,
+    cwd: str | os.PathLike[str] | None,
+    env: dict[str, str] | None,
+    check: bool,
+    timeout: float | None,
+    input: str | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a command, logging stdout/stderr line-by-line as it arrives.
+
+    Same contract as :func:`run`: the returned CompletedProcess carries the full
+    captured text, and a non-zero exit or a timeout raises SubprocessError with
+    whatever was collected before the process ended. The difference is purely that
+    the caller sees output live rather than only on exit.
+    """
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+
+    proc = subprocess.Popen(  # noqa: S603 - cmd is a sequence, never a shell string
+        list(cmd),
+        cwd=cwd,
+        env=env,
+        # DEVNULL, never None. `None` makes the child INHERIT the harness's stdin,
+        # which in an interactive run is the operator's terminal. A CLI agent that
+        # finds an open, non-TTY stdin can sit reading it forever: observed with the
+        # gemini CLI, which prints "256-color support not detected" and then blocks,
+        # looking exactly like a model call that never returns. It burned the full
+        # agent timeout every time. No subprocess this harness launches has any
+        # business reading the operator's keyboard.
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    out_thread = threading.Thread(target=_pump, args=(proc.stdout, "out", out_buf), daemon=True)
+    err_thread = threading.Thread(target=_pump, args=(proc.stderr, "err", err_buf), daemon=True)
+    out_thread.start()
+    err_thread.start()
+
+    if input is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(input)
+        finally:
+            proc.stdin.close()
+
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # Kill first, THEN join the pumps: they only exit when the pipes close, and
+        # the pipes only close when the child dies. Joining first would hang here
+        # for exactly as long as the child would have run anyway.
+        proc.kill()
+        proc.wait()
+        out_thread.join(timeout=5)
+        err_thread.join(timeout=5)
+        _log.error("command timed out after %ss: %s", timeout, rendered)
+        raise SubprocessError(
+            cmd,
+            returncode=-1,
+            stdout="".join(out_buf),
+            stderr="".join(err_buf),
+        ) from exc
+
+    out_thread.join(timeout=5)
+    err_thread.join(timeout=5)
+
+    if check and returncode != 0:
+        _log.error("command exited with %s: %s", returncode, rendered)
+        raise SubprocessError(
+            cmd,
+            returncode=returncode,
+            stdout="".join(out_buf),
+            stderr="".join(err_buf),
+        )
+
+    return subprocess.CompletedProcess(
+        args=list(cmd),
+        returncode=returncode,
+        stdout="".join(out_buf),
+        stderr="".join(err_buf),
+    )
 
 
 def _as_text(value: str | bytes | None) -> str | None:

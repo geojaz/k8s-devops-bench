@@ -266,7 +266,7 @@ class TFDeployer(Deployer):
             raise ConfigError(f"TF directory not found: {self.work_dir} (stack: {self.tf_dir})")
 
         self.provider.ensure_account_credentials()
-        run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False)
+        run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False, stream=True)
 
         cmd = [
             "tofu",
@@ -276,7 +276,7 @@ class TFDeployer(Deployer):
             *self._state_flags(),
             *self._var_flags(),
         ]
-        run(cmd, cwd=self.work_dir, capture=False)
+        run(cmd, cwd=self.work_dir, capture=False, stream=True)
 
     def down(self) -> None:
         tf_path = Path(self.work_dir)
@@ -289,7 +289,7 @@ class TFDeployer(Deployer):
             return
 
         self.provider.ensure_account_credentials()
-        run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False)
+        run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False, stream=True)
 
         cmd = [
             "tofu",
@@ -299,7 +299,7 @@ class TFDeployer(Deployer):
             *self._state_flags(),
             *self._var_flags(),
         ]
-        run(cmd, cwd=self.work_dir, capture=False)
+        run(cmd, cwd=self.work_dir, capture=False, stream=True)
 
     def get_cluster_info(self) -> ClusterInfo:
         """Read cluster details from the stack outputs.
@@ -313,7 +313,7 @@ class TFDeployer(Deployer):
         Raises:
             ConfigError: If required outputs are missing or unparseable.
         """
-        run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False)
+        run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False, stream=True)
 
         result = run(
             ["tofu", "output", "-json", *self._state_flags()],
