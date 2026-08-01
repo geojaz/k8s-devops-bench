@@ -7,7 +7,7 @@ infrastructure:
   teardown: true
 prompt: |
   You are the platform engineer on call for the Kubernetes cluster '{{CLUSTER_NAME}}'. Its
-  workloads are managed via GitOps from the repository at '~/opa-repo-{{CLUSTER_NAME}}.git' (the source of truth).
+  workloads are managed via GitOps from the repository at '/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git' (the source of truth).
 
   Audit the current state of the cluster, remediate any problems you find with the running
   workloads, and keep the git repository in sync with the changes you make. When you're done,
@@ -94,43 +94,47 @@ verification_spec:
   # originally equal-weighted objective groups (repo-remediated,
   # cluster-compliant, policy-enforced, policy-reports-clear), matching the
   # 1.0-per-group scheme the other three already use.
+  #
+  # repo_path values point at the minted scratch root
+  # (/tmp/devops-bench/...), matching the prompt above: the repo no longer
+  # lives under a free-form, tilde-expandable path.
   - name: repo-remediated
     role: objective
     check:
       type: all
       checks:
         - type: git_repo_sync
-          repo_path: "~/opa-repo-{{CLUSTER_NAME}}.git"
+          repo_path: "/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git"
           op: exists
           require_new_commit: true
         - type: git_repo_sync
-          repo_path: "~/opa-repo-{{CLUSTER_NAME}}.git"
+          repo_path: "/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git"
           file: workloads/team-alpha.yaml
           path: "$[?(@.metadata.name=='cache')]"
           op: exists
         - type: git_repo_sync
-          repo_path: "~/opa-repo-{{CLUSTER_NAME}}.git"
+          repo_path: "/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git"
           file: workloads/team-alpha.yaml
           path: "$[?(@.metadata.name=='cache')].spec.template.spec.containers[*].securityContext.privileged"
           op: absent
         - type: git_repo_sync
-          repo_path: "~/opa-repo-{{CLUSTER_NAME}}.git"
+          repo_path: "/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git"
           file: workloads/team-beta.yaml
           path: "$[?(@.metadata.name=='payments')]"
           op: exists
         - type: git_repo_sync
-          repo_path: "~/opa-repo-{{CLUSTER_NAME}}.git"
+          repo_path: "/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git"
           file: workloads/team-beta.yaml
           path: "$[?(@.metadata.name=='payments')].spec.template.spec.containers[*].securityContext.privileged"
           op: absent
         - type: git_repo_sync
-          repo_path: "~/opa-repo-{{CLUSTER_NAME}}.git"
+          repo_path: "/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git"
           file: workloads/team-alpha.yaml
           path: "$[?(@.metadata.name=='web')].spec.template.spec.containers[*].resources.limits"
           op: exists
           across_matches: every
         - type: git_repo_sync
-          repo_path: "~/opa-repo-{{CLUSTER_NAME}}.git"
+          repo_path: "/tmp/devops-bench/opa-repo-{{CLUSTER_NAME}}.git"
           file: workloads/team-gamma.yaml
           path: "$[?(@.metadata.name=='worker')].spec.template.spec.containers[*].resources.limits"
           op: exists
