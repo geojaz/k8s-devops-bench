@@ -171,6 +171,10 @@ class ExternalHttpProbeVerifier(BaseVerifier):
         return self._poll_to_result(self._check, timeout_sec)
 
     def _objects(self) -> list[dict[str, Any]]:
+        # kubeconfig and context are both pinned to the run's cluster: the
+        # ambient current-context is a mutable global any run can rewrite,
+        # and discovery has to read the cluster under test, not whichever
+        # one happens to be ambient.
         discovery_timeout = self.probe_timeout + _KUBECTL_OVERHEAD_SEC
         if self.name is not None:
             obj = get_resource(
@@ -178,6 +182,7 @@ class ExternalHttpProbeVerifier(BaseVerifier):
                 self.name,
                 namespace=self.namespace,
                 kubeconfig=self.kubeconfig,
+                context=self.context,
                 timeout=discovery_timeout,
             )
             return [obj]
@@ -186,6 +191,7 @@ class ExternalHttpProbeVerifier(BaseVerifier):
             selector=self.selector,
             namespace=self.namespace,
             kubeconfig=self.kubeconfig,
+            context=self.context,
             timeout=discovery_timeout,
         )
         return result.get("items", [])

@@ -262,6 +262,7 @@ def run_pod(
     kubeconfig: KubeconfigSource = None,
     timeout: float | None = None,
     env: dict[str, str] | None = None,
+    context: str | None = None,
 ) -> str:
     """Run a one-shot ephemeral pod and return its captured stdout.
 
@@ -283,6 +284,9 @@ def run_pod(
         kubeconfig: Kubeconfig path or context-like object.
         timeout: Optional timeout in seconds forwarded to ``core.subprocess.run``.
         env: Optional env vars injected into the container via ``--env=K=V``.
+        context: Optional kubeconfig context to pin the call to. A probe pod
+            has to run against the cluster under test, not whichever cluster
+            the ambient current-context happens to point at.
 
     Returns:
         The pod's captured stdout.
@@ -308,7 +312,7 @@ def run_pod(
     extra_kwargs: dict[str, Any] = {}
     if timeout is not None:
         extra_kwargs["timeout"] = timeout
-    completed = _run_kubectl(argv, kubeconfig, **extra_kwargs)
+    completed = _run_kubectl(argv, kubeconfig, context=context, **extra_kwargs)
     return completed.stdout
 
 
