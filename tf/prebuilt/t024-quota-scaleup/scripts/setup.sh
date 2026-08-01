@@ -45,8 +45,11 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-180}"
 # uses kubectl's own escaped-dot dialect instead.) Kept consistent with the
 # `guarded_read` the factory compiler now generates into every seed.sh/
 # verify.sh (devops-bench-factory's compiler/signals.py GUARD_PREAMBLE).
+# The `|| __rc=$?` on the read below is load-bearing under `set -e` --
+# a bare assignment from a failing command substitution would silently
+# exit this whole script before the check above ever runs.
 _ERRFILE="$(mktemp)"; trap 'rm -f "$_ERRFILE"' EXIT
-guarded_read(){ local __v="$1"; shift; local __out __rc; __out="$("$@" 2>"$_ERRFILE")"; __rc=$?; if [ $__rc -ne 0 ] && grep -qE 'error parsing jsonpath|invalid array index|unable to parse|unrecognized|unknown flag|unknown command' "$_ERRFILE"; then echo "CHECK BUG: malformed kubectl query ($*): $(cat "$_ERRFILE")" >&2; exit 1; fi; printf -v "$__v" '%s' "$__out"; }
+guarded_read(){ local __v="$1"; shift; local __out __rc=0; __out="$("$@" 2>"$_ERRFILE")" || __rc=$?; if [ "$__rc" -ne 0 ] && grep -qE 'error parsing jsonpath|invalid array index|unable to parse|unrecognized|unknown flag|unknown command' "$_ERRFILE"; then echo "CHECK BUG: malformed kubectl query ($*): $(cat "$_ERRFILE")" >&2; exit 1; fi; printf -v "$__v" '%s' "$__out"; }
 
 echo "==> Applying seed manifests (Namespace, ResourceQuota, Deployment, Service, in that order)..."
 kubectl apply -f "${MANIFESTS_DIR}/seed.yaml"
