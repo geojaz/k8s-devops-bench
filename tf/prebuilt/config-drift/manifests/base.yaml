@@ -1,0 +1,127 @@
+# config-drift seed. Three independent mechanisms all point the same direction, each
+# sufficient on its own to make declared and effective configuration disagree:
+#
+#   DEFECT A: checkout-config is immutable. Its data already reads PRICING_ENGINE=v2
+#     (seeded that way from the start, not because anyone's edit landed -- an
+#     immutable ConfigMap rejects every subsequent update outright).
+#
+#   DEFECT B: the checkout Deployment reads via envFrom (picking up v2 from the
+#     ConfigMap) but ALSO carries an explicit env entry pinning PRICING_ENGINE=v1.
+#     An explicit env entry always wins over envFrom, so v1 is what the container
+#     actually gets, regardless of what the ConfigMap says.
+#
+#   DEFECT C: implicit rather than a separate seeded field. checkout's pods reflect
+#     this manifest as applied -- the shadow already in place -- exactly like a real
+#     incident where nobody has fixed anything yet. envFrom/env only take effect at
+#     pod creation and never hot-reload, so if an agent later replaces this same
+#     ConfigMap object (rather than the Deployment's env, which auto-rolls on
+#     change) with a corrected one under the SAME name, the Deployment's envFrom
+#     reference does not change and no automatic rollout is triggered -- the running
+#     pods keep the stale environment until manually restarted.
+#
+# receipts reads a DIFFERENT key from the same ConfigMap and is entirely healthy;
+# it exists so that a careless fix (delete-and-recreate checkout-config without
+# carrying every key forward) has an innocent bystander to damage.
+#
+# Order within this single file is load-bearing in the ordinary "apply top to
+# bottom" sense only: the ConfigMap has to exist before the Deployments that
+# reference it, which a single `kubectl apply -f` on one multi-doc file already
+# guarantees. No wait has to happen in between, so this stays one file rather than
+# being split like nightly-backlog's.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkout-config
+  namespace: shop
+  labels:
+    app: checkout
+immutable: true
+data:
+  PRICING_ENGINE: "v2"
+  RECEIPT_TEMPLATE: "standard-v1"
+---
+# LIMITATION: the real incident's image is a private ghcr.io/acme/checkout:3.2 that
+# does not exist and cannot be pulled. Substituted with a stock nginx image per this
+# stack's hard rule against fabricated/private image references. This task's own
+# verification_spec (task.yaml, unmodified here) selects the checkout container by
+# matching the literal substring "checkout" in its `image` field
+# (`containers[?(@.image =~ "checkout")]`) in several checks, including an
+# image-unchanged safeguard that expects the literal value
+# "ghcr.io/acme/checkout:3.2". Neither will match this substitute image. This
+# stack's own setup.sh self-check does not depend on the image string, only on the
+# ConfigMap's data, the Deployment's env, and both Deployments' readiness, so the
+# seed itself is unaffected -- but the task's downstream grading checks that key off
+# the image field will need a follow-up fix (e.g. filtering by container name
+# instead of image content) to work against this substitution.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: shop
+  labels:
+    app: checkout
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      containers:
+        - name: checkout
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          envFrom:
+            - configMapRef:
+                name: checkout-config
+          # DEFECT B: this explicit entry shadows PRICING_ENGINE=v2 from envFrom
+          # above. Added months ago to pin v1 during an incident and never removed.
+          env:
+            - name: PRICING_ENGINE
+              value: "v1"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: receipts
+  namespace: shop
+  labels:
+    app: receipts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: receipts
+  template:
+    metadata:
+      labels:
+        app: receipts
+    spec:
+      containers:
+        - name: receipts
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          env:
+            - name: RECEIPT_TEMPLATE
+              valueFrom:
+                configMapKeyRef:
+                  name: checkout-config
+                  key: RECEIPT_TEMPLATE
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi

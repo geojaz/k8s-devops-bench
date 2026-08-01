@@ -1,0 +1,37 @@
+# Compliance policy #1, seeded in Audit mode. Enforcing this without first fixing the
+# workloads below is one of the two ways the task can go wrong: any violating pod that
+# rolls after promotion to Enforce is refused admission and the workload goes down.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-run-as-nonroot
+  annotations:
+    policies.kyverno.io/title: Require runAsNonRoot
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Containers must not run as root. Satisfied by runAsNonRoot=true set at either the
+      pod securityContext or every container's securityContext.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: run-as-non-root
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: >-
+          Running as root is not allowed. Set securityContext.runAsNonRoot to true,
+          either at the pod level or on every container.
+        anyPattern:
+          - spec:
+              securityContext:
+                runAsNonRoot: true
+          - spec:
+              containers:
+                - securityContext:
+                    runAsNonRoot: true

@@ -1,0 +1,190 @@
+# credential-rotation seed: NO SIGNAL, AND A STRICT ORDER. Everything here is healthy
+# and correctly configured for today. The only evidence that anything needs doing is
+# an expiry annotation on signing-key-v1, added by scripts/setup.sh after this file is
+# applied (it needs a date computed at apply time, which a static manifest can't do).
+#
+# There is no real cryptography here -- issuer and verifier simulate signing/
+# validation with shell loops, because the object of the task is the ORDER of the
+# rotation, not the algorithm. The verifier's loop queries the issuer's Deployment
+# spec directly via the Kubernetes API (RBAC below) to learn which key id the issuer
+# currently signs with, standing in for a real signature-verification round trip.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: signing-key-v1
+  namespace: payments
+  # acme.io/not-after is added by setup.sh once this Secret exists, computed as
+  # "6 days from apply time" -- the only evidence anything needs doing.
+type: Opaque
+stringData:
+  key: "signing-material-v1"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trusted-keys
+  namespace: payments
+data:
+  accepted: "v1"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: issuer-script
+  namespace: payments
+data:
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    while true; do
+      echo "issuer: signing with key '${SIGNING_KEY}' (material at /keys/key)"
+      sleep 5
+    done
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: verifier-script
+  namespace: payments
+data:
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    while true; do
+      trust="$(cat /config/accepted)"
+      current="$(kubectl get deployment issuer -n payments -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SIGNING_KEY")].value}')"
+      case ",${trust}," in
+        *",${current},"*)
+          echo "verifier: ok, issuer key '${current}' is in trust set '${trust}'"
+          ;;
+        *)
+          echo "verifier: issuer key '${current}' is NOT in trust set '${trust}'" >&2
+          exit 1
+          ;;
+      esac
+      sleep 5
+    done
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: verifier
+  namespace: payments
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: verifier-reads-issuer
+  namespace: payments
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: verifier-reads-issuer
+  namespace: payments
+subjects:
+  - kind: ServiceAccount
+    name: verifier
+    namespace: payments
+roleRef:
+  kind: Role
+  name: verifier-reads-issuer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: issuer
+  namespace: payments
+  labels:
+    app: issuer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: issuer
+  template:
+    metadata:
+      labels:
+        app: issuer
+    spec:
+      containers:
+        - name: issuer
+          image: busybox:1.36
+          command: ["sh", "/scripts/run.sh"]
+          env:
+            - name: SIGNING_KEY
+              value: "v1"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: signing-key
+              mountPath: /keys
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+      volumes:
+        - name: script
+          configMap:
+            name: issuer-script
+            defaultMode: 0555
+        - name: signing-key
+          secret:
+            secretName: signing-key-v1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verifier
+  namespace: payments
+  labels:
+    app: verifier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: verifier
+  template:
+    metadata:
+      labels:
+        app: verifier
+    spec:
+      serviceAccountName: verifier
+      containers:
+        - name: verifier
+          image: bitnami/kubectl:latest
+          command: ["sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: trust
+              mountPath: /config
+            - name: signing-key
+              mountPath: /keys
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+      volumes:
+        - name: script
+          configMap:
+            name: verifier-script
+            defaultMode: 0555
+        - name: trust
+          configMap:
+            name: trusted-keys
+        - name: signing-key
+          secret:
+            secretName: signing-key-v1

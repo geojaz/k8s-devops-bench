@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-alpha
+---
+# VIOLATES require-run-as-nonroot only. No securityContext at all, so the container
+# runs as the image's default (root), and the tag is pinned, so disallow-latest-tag is
+# clean here. Stock nginx: default root user only needs to bind :80, no image tricks
+# required to make this both violating AND actually Ready.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: team-alpha
+  labels:
+    app: web
+spec:
+  # revisionHistoryLimit: 0 keeps no old ReplicaSets around. A superseded ReplicaSet
+  # keeps its Kyverno PolicyReport (result: fail) alive, which would make a
+  # namespace-wide "reports clear" check unsatisfiable even after a correct fix.
+  revisionHistoryLimit: 0
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

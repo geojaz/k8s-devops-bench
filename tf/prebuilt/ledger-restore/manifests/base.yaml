@@ -1,0 +1,145 @@
+# ledger-restore seed, part 1: everything that can be applied declaratively.
+# The actual defect (worker2 cordoned out from under ledger-1's bound PV) is
+# imperative and lives in scripts/setup.sh, because it depends on discovering
+# which node the PV actually bound to -- see that script for why.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ledger
+---
+# Headless Service the StatefulSet needs for stable network identity. Not part
+# of the incident.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger
+  namespace: ledger
+spec:
+  clusterIP: None
+  selector:
+    app: ledger
+  ports:
+    - name: app
+      port: 8080
+---
+# Distractor 2: close to its ceiling, not binding. spec.hard values are what
+# the task's quota-untouched safeguard checks; status.used naturally settles
+# well under them once the 4 pods below (3 ledger + 1 audit) are running.
+#
+# LIMITATION: the task.yaml topology comment describes usage at "pods 8/10,
+# requests.memory 1.6Gi/2Gi". This seed does not add filler workloads to
+# reproduce that exact used count -- only the hard ceiling the safeguard
+# actually checks (pods=10, requests.memory=2Gi) is guaranteed. Actual usage
+# here settles around 4 pods and a few hundred Mi, not 8/1.6Gi.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ledger-quota
+  namespace: ledger
+spec:
+  hard:
+    pods: "10"
+    requests.memory: 2Gi
+---
+# Distractor 1: a deliberately preserved reproduction case for an upstream bug.
+# The initContainer always fails, so the pod sits in Init:CrashLoopBackOff
+# forever. Loud, in the same namespace, and NOT the incident.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: audit
+  namespace: ledger
+  annotations:
+    acme.io/do-not-repair: upstream-issue-4417
+spec:
+  serviceName: audit
+  replicas: 1
+  selector:
+    matchLabels:
+      app: audit
+  template:
+    metadata:
+      labels:
+        app: audit
+    spec:
+      initContainers:
+        - name: audit-init
+          image: busybox:1.36
+          command: ["sh", "-c", "echo 'reproducing upstream-issue-4417'; exit 1"]
+          # ledger-quota constrains requests.memory namespace-wide, and Kubernetes
+          # requires every container (initContainers included) to declare it.
+          # Without this, the pod is rejected at admission before it can ever
+          # reach Init:CrashLoopBackOff, and the distractor silently does not exist.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+      containers:
+        - name: audit
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+---
+# The workload under test. Nothing in this spec is wrong: three replicas, a
+# volumeClaimTemplate on the default "standard" (local-path) storage class, and
+# a toleration for the maintenance taint scripts/setup.sh applies to whichever
+# worker ISN'T holding this StatefulSet's data (distractor 3). The actual
+# defect -- one worker cordoned after ledger-1's PV already bound there -- is
+# applied imperatively in setup.sh once it knows which worker that is.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ledger
+  namespace: ledger
+spec:
+  serviceName: ledger
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ledger
+  template:
+    metadata:
+      labels:
+        app: ledger
+    spec:
+      tolerations:
+        - key: maintenance
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # Soft preference to spread across both workers rather than stacking all
+      # three on one. Not guaranteed: the scheduler may still land them
+      # unevenly, which is why setup.sh discovers ledger-1's node at runtime
+      # instead of assuming a name.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ledger
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: ledger
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 256Mi
