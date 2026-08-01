@@ -15,6 +15,7 @@
 """Concrete single-condition verifiers."""
 
 from devops_bench.verification.verifiers.external_http_probe import ExternalHttpProbeVerifier
+from devops_bench.verification.verifiers.git_repo_sync import GitRepoSyncVerifier
 from devops_bench.verification.verifiers.http_probe import HttpProbeVerifier
 from devops_bench.verification.verifiers.pod_healthy import PodHealthyVerifier
 from devops_bench.verification.verifiers.resource_property import (
@@ -24,6 +25,7 @@ from devops_bench.verification.verifiers.scaling_complete import ScalingComplete
 
 __all__ = [
     "ExternalHttpProbeVerifier",
+    "GitRepoSyncVerifier",
     "HttpProbeVerifier",
     "PodHealthyVerifier",
     "ResourcePropertyVerifier",
