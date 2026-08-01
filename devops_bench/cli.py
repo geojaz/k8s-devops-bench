@@ -26,7 +26,7 @@ import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from devops_bench.core import ConfigError
+from devops_bench.core import ConfigError, configure_logging
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
     from devops_bench.run import BenchmarkConfig
@@ -99,6 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicit run id for isolation/artifact naming (default: RUN_ID env or generated).",
     )
+    parser.add_argument(
+        "--log-level",
+        dest="log_level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging verbosity. DEBUG streams agent and subprocess output line-by-line.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Shortcut for --log-level DEBUG.",
+    )
     return parser
 
 
@@ -155,6 +167,12 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Nothing else in the package calls configure_logging, so without this the
+    # devops_bench logger carries no handler and every _log.debug/_log.error in the
+    # harness is discarded. That is why a wedged agent produced no output at all
+    # until the harness reaped it at the timeout.
+    configure_logging(args.log_level or ("DEBUG" if args.verbose else None))
 
     # args_to_config runs inside the try: BenchmarkConfig.from_env raises
     # ConfigError on malformed env (e.g. a non-integer EVAL_LIMIT), which must
