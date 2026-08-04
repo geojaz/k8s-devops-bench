@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import threading
 from collections.abc import Mapping, Sequence
@@ -25,11 +26,84 @@ from typing import IO
 from devops_bench.core.errors import SubprocessError
 from devops_bench.core.logging import get_logger
 
-__all__ = ["run", "CompletedProcess"]
+__all__ = ["run", "redact", "tag_current_thread", "CompletedProcess"]
 
 type CompletedProcess = subprocess.CompletedProcess[str]
 
 _log = get_logger("core.subprocess")
+
+# Names that mark an env-var assignment's value as secret-shaped, regardless
+# of provider (GEMINI_API_KEY, GOOGLE_API_KEY, ANTHROPIC_API_KEY, ...).
+_SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
+
+# `NAME=value` assignments, whether standalone (`FOO=bar cmd`) or following a
+# docker-style `-e` flag (`-e FOO=bar`): both render as the same substring in
+# the space-joined command string this module logs.
+_ENV_ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
+
+# Bare secret shapes to catch even outside an env-var assignment, e.g. a key
+# embedded in a URL or CLI flag value. Google API keys today; extend as other
+# providers' key shapes turn up in a logged command.
+_BARE_SECRET_PATTERNS = [re.compile(r"AIza[0-9A-Za-z_-]{35}")]
+
+_thread_local = threading.local()
+
+
+def _mask(value: str) -> str:
+    return f"{value[:4]}****"
+
+
+def redact(cmd_str: str) -> str:
+    """Mask secret-shaped values in a rendered command string, for logging only.
+
+    Never apply this to the command actually executed; it exists solely to
+    keep secrets out of log output.
+
+    Masks two things:
+        * The value of any ``NAME=value`` assignment (bare or after ``-e``)
+          whose name matches a secret pattern (KEY, TOKEN, SECRET, PASSWORD,
+          CREDENTIAL, case-insensitive).
+        * Any bare token matching a known secret key shape, whether or not it
+          appears in a ``NAME=value`` assignment.
+
+    Args:
+        cmd_str: The space-joined command string about to be logged.
+
+    Returns:
+        The same string with secret-shaped values masked, preserving a
+        4-character prefix (e.g. ``AIza****``).
+    """
+
+    def _replace_env(match: re.Match[str]) -> str:
+        name, value = match.group(1), match.group(2)
+        if _SECRET_NAME_RE.search(name):
+            return f"{name}={_mask(value)}"
+        return match.group(0)
+
+    redacted = _ENV_ASSIGNMENT_RE.sub(_replace_env, cmd_str)
+    for pattern in _BARE_SECRET_PATTERNS:
+        redacted = pattern.sub(lambda m: _mask(m.group(0)), redacted)
+    return redacted
+
+
+def tag_current_thread(tag: str | None) -> None:
+    """Set (or clear) a tag applied to every "running command" log line from this thread.
+
+    :class:`~devops_bench.evalharness.safeguard_monitor.SafeguardMonitor` runs
+    its periodic sampling on its own daemon thread; without a tag, its
+    ``kubectl`` calls are indistinguishable in the log from the agent's own
+    activity. A thread-local flag needs no plumbing through the sampling call
+    chain (verifier -> get_resource -> this module) to reach the log line.
+
+    Args:
+        tag: Short label included in the log line, e.g. ``"sample"``.
+            ``None`` clears any tag set on the current thread.
+    """
+    if tag is None:
+        if hasattr(_thread_local, "tag"):
+            del _thread_local.tag
+    else:
+        _thread_local.tag = tag
 
 
 def _build_env(
@@ -82,7 +156,9 @@ def run(
         ValueError: If ``stream`` is set without ``text``.
     """
     rendered = " ".join(str(arg) for arg in cmd)
-    _log.debug("running command: %s (cwd=%s)", rendered, cwd or os.getcwd())
+    tag = getattr(_thread_local, "tag", None)
+    prefix = f"running command [{tag}]:" if tag else "running command:"
+    _log.debug("%s %s (cwd=%s)", prefix, redact(rendered), cwd or os.getcwd())
 
     if stream:
         if not text:
@@ -113,7 +189,7 @@ def run(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        _log.error("command timed out after %ss: %s", timeout, rendered)
+        _log.error("command timed out after %ss: %s", timeout, redact(rendered))
         raise SubprocessError(
             cmd,
             returncode=-1,
@@ -122,7 +198,7 @@ def run(
         ) from exc
 
     if check and completed.returncode != 0:
-        _log.error("command exited with %s: %s", completed.returncode, rendered)
+        _log.error("command exited with %s: %s", completed.returncode, redact(rendered))
         raise SubprocessError(
             cmd,
             returncode=completed.returncode,
@@ -206,7 +282,7 @@ def _run_streamed(
         proc.wait()
         out_thread.join(timeout=5)
         err_thread.join(timeout=5)
-        _log.error("command timed out after %ss: %s", timeout, rendered)
+        _log.error("command timed out after %ss: %s", timeout, redact(rendered))
         raise SubprocessError(
             cmd,
             returncode=-1,
@@ -218,7 +294,7 @@ def _run_streamed(
     err_thread.join(timeout=5)
 
     if check and returncode != 0:
-        _log.error("command exited with %s: %s", returncode, rendered)
+        _log.error("command exited with %s: %s", returncode, redact(rendered))
         raise SubprocessError(
             cmd,
             returncode=returncode,
