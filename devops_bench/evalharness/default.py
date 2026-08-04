@@ -662,6 +662,18 @@ class DefaultEvalHarness(Harness):
                 "hold safeguard was never sampled by the monitor during the agent's "
                 "turn; a safeguard nobody watched must not read as one that held",
             )
+        elif not obs.armed:
+            # arm_on="first_true" and no sample ever passed. This is a FAIL, not
+            # an error: the monitor did its job and the state was never brought
+            # about. Never attaining a state is not the same as holding it, and
+            # reporting this as an error would let an agent that simply never did
+            # the work fall out of the denominator.
+            success, status = False, "fail"
+            reason = (
+                f"attain-then-hold never armed: the condition was false at every one "
+                f"of {obs.sample_count} sample(s) across the agent's turn, so the "
+                "state it was supposed to bring about was never reached"
+            )
         elif obs.violated:
             success, status = False, "fail"
             reason = (
@@ -670,9 +682,15 @@ class DefaultEvalHarness(Harness):
             )
         else:
             success, status = True, "pass"
+            armed_note = ""
+            if obs.armed_at_sec is not None:
+                armed_note = (
+                    f", armed {obs.armed_at_sec:.1f}s in after "
+                    f"{obs.pre_arm_sample_count} sample(s) with the condition still false"
+                )
             reason = (
                 f"held for {obs.sample_count} sample(s) across the agent's turn "
-                f"({obs.error_count} sample(s) could not be evaluated)"
+                f"({obs.error_count} sample(s) could not be evaluated){armed_note}"
             )
 
         return {

@@ -93,6 +93,20 @@ class HoldObservation:
         error_count: Of ``sample_count``, how many could not be evaluated
             (the check itself failed to run, as distinct from running and
             observing the condition false). Never counted as a violation.
+        armed: Whether failing samples count yet. Always True from the first
+            sample for an ``arm_on="start"`` entry (the default, and the only
+            behaviour before this field existed). For ``arm_on="first_true"``
+            it starts False and flips on the first PASSING sample, which is
+            what makes "bring this state about, then do not let it regress"
+            expressible: the entry is not asked to hold something that is not
+            true yet.
+        armed_at_sec: Seconds after the monitor started that ``armed`` became
+            True, via ``time.monotonic()``. ``None`` while still disarmed.
+        pre_arm_sample_count: Of ``sample_count``, how many were taken before
+            arming and therefore discarded. Reported rather than dropped: it
+            is the difference between "the agent attained this immediately"
+            and "the agent attained it at the last moment", which a grader
+            reading a passing entry would otherwise have no way to see.
     """
 
     violated: bool = False
@@ -100,6 +114,9 @@ class HoldObservation:
     first_violation_at_sec: float | None = None
     sample_count: int = 0
     error_count: int = 0
+    armed: bool = True
+    armed_at_sec: float | None = None
+    pre_arm_sample_count: int = 0
 
 
 class SafeguardMonitor:
@@ -125,8 +142,13 @@ class SafeguardMonitor:
     def __init__(self, entries: list[VerificationEntry]) -> None:
         self._entries: list[VerificationEntry] = list(entries)
         self._agent = VerifierAgent()
+        # An arm_on="first_true" entry starts DISARMED: its condition is not
+        # expected to be true yet, so failing samples must not count until the
+        # agent has brought it about. Every other entry is armed from the
+        # first sample, which is the behaviour that existed before arm_on.
         self._observations: dict[str, HoldObservation] = {
-            entry.name: HoldObservation() for entry in self._entries
+            entry.name: HoldObservation(armed=not entry.arms_on_first_true)
+            for entry in self._entries
         }
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -239,6 +261,14 @@ class SafeguardMonitor:
         Any exception raised while evaluating (a bug in a leaf verifier, an
         unexpected error in the runner) is caught here and folded in as an
         error sample, not a violation, and never propagates.
+
+        A DISARMED entry (``arm_on="first_true"``, nothing true yet) discards
+        failing samples instead of recording them, and arms on the first
+        passing one. Without that, a state the agent is supposed to BRING
+        ABOUT is sampled as false at t0, the sticky violation fires on the
+        very first sample, and the entry can never recover. Three blueprints
+        hit exactly that and aborted at setup before an agent ever ran (see
+        the 2026-08-03/04 sweep, finding F6).
         """
         elapsed = time.monotonic() - self._start_time if self._start_time is not None else 0.0
         try:
@@ -255,7 +285,16 @@ class SafeguardMonitor:
             obs = self._observations[entry.name]
             obs.sample_count += 1
             if result.status == "error":
+                # An error tells us nothing either way, so it must not arm a
+                # disarmed entry any more than it may violate an armed one.
                 obs.error_count += 1
+                return
+            if not obs.armed:
+                if result.success:
+                    obs.armed = True
+                    obs.armed_at_sec = elapsed
+                else:
+                    obs.pre_arm_sample_count += 1
                 return
             if not result.success and not obs.violated:
                 obs.violated = True

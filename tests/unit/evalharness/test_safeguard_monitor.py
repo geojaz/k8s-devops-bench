@@ -102,6 +102,42 @@ class _RaisingLeaf(BaseVerifier):
         raise RuntimeError("boom")
 
 
+@VERIFIERS.register("sg_false_then_true")
+class _FalseThenTrue(BaseVerifier):
+    """Fails until sample ``true_from``, then holds forever after.
+
+    Models an attain-then-hold row: the state the agent must BRING ABOUT is
+    false when the turn starts, becomes true once the agent does the work, and
+    must not regress afterwards.
+    """
+
+    type: Literal["sg_false_then_true"] = "sg_false_then_true"
+    true_from: int = 3
+    calls: int = 0
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        self.calls += 1
+        if self.calls < self.true_from:
+            return VerificationResult(
+                success=False, elapsed_time=0.0, reason="not yet attained", name=self.name
+            )
+        return VerificationResult(success=True, elapsed_time=0.0, reason="held", name=self.name)
+
+
+@VERIFIERS.register("sg_always_fail")
+class _AlwaysFail(BaseVerifier):
+    """Test double that never holds, for the never-armed case."""
+
+    type: Literal["sg_always_fail"] = "sg_always_fail"
+    calls: int = 0
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        self.calls += 1
+        return VerificationResult(
+            success=False, elapsed_time=0.0, reason="never attained", name=self.name
+        )
+
+
 def _hold_entry(check: dict[str, Any], **extra: Any) -> VerificationEntry:
     payload = {
         "name": "e",
@@ -282,3 +318,127 @@ def test_run_one_stops_and_joins_the_safeguard_monitor_when_the_agent_raises(
 
     assert record["status"] == "failed"
     assert not any(t.name == "safeguard-monitor" for t in threading.enumerate())
+
+
+# -- arm_on: first_true (attain-then-hold) ---------------------------------
+#
+# Motivating failure: the overnight sweep of 2026-08-03/04 (finding F6). Three
+# blueprints authored a hold row for a state the AGENT was supposed to bring
+# about. The monitor arms before the agent's turn and its violations are
+# sticky, so the very first sample recorded a violation that could never be
+# cleared, and all three tasks aborted at setup before an agent ever ran.
+
+
+def test_first_true_ignores_failing_samples_until_the_state_is_attained() -> None:
+    entry = _hold_entry(
+        {"type": "sg_false_then_true", "true_from": 3},
+        hold_poll_interval_sec=_POLL_INTERVAL_SEC,
+        arm_on="first_true",
+    )
+    monitor = SafeguardMonitor([entry])
+    monitor.start()
+    time.sleep(_SAMPLE_WINDOW_SEC)
+    monitor.stop()
+
+    obs = monitor.get_observations()[entry.name]
+    assert obs.armed is True
+    assert obs.violated is False, "samples before arming must not count as violations"
+    assert obs.pre_arm_sample_count == 2
+    assert obs.armed_at_sec is not None
+
+
+def test_first_true_still_catches_a_regression_after_arming() -> None:
+    """Arming must not disable stickiness: once attained, a later drop still fails."""
+    entry = _hold_entry(
+        {"type": "sg_flip", "fail_at": 2}, hold_poll_interval_sec=_POLL_INTERVAL_SEC,
+        arm_on="first_true",
+    )
+    monitor = SafeguardMonitor([entry])
+    monitor.start()
+    time.sleep(_SAMPLE_WINDOW_SEC)  # pass (arms), FAIL, pass, pass...
+    monitor.stop()
+
+    obs = monitor.get_observations()[entry.name]
+    assert obs.armed is True
+    assert obs.violated is True
+    assert obs.first_violation_reason == "dropped mid-run"
+
+
+def test_a_never_attained_first_true_entry_stays_disarmed() -> None:
+    entry = _hold_entry(
+        {"type": "sg_always_fail"}, hold_poll_interval_sec=_POLL_INTERVAL_SEC,
+        arm_on="first_true",
+    )
+    monitor = SafeguardMonitor([entry])
+    monitor.start()
+    time.sleep(_SAMPLE_WINDOW_SEC)
+    monitor.stop()
+
+    obs = monitor.get_observations()[entry.name]
+    assert obs.armed is False
+    assert obs.violated is False, "never attaining is not the same as violating"
+    assert obs.pre_arm_sample_count >= 2
+
+
+def test_a_never_armed_entry_is_reported_as_a_failure_not_an_error() -> None:
+    """Never doing the work must not fall out of the denominator as an error."""
+    entry = _hold_entry(
+        {"type": "sg_always_fail"}, hold_poll_interval_sec=_POLL_INTERVAL_SEC,
+        arm_on="first_true",
+    )
+    obs = HoldObservation(armed=False, sample_count=4, pre_arm_sample_count=4)
+    row = DefaultEvalHarness._hold_report_entry(entry, obs)  # noqa: SLF001
+
+    assert row["success"] is False
+    assert row["status"] == "fail"
+    assert "never armed" in row["reason"]
+
+
+def test_an_error_sample_does_not_arm_a_disarmed_entry() -> None:
+    """An error tells us nothing either way, so it must not stand in for attainment."""
+    entry = _hold_entry(
+        {"type": "sg_error"}, hold_poll_interval_sec=_POLL_INTERVAL_SEC,
+        arm_on="first_true",
+    )
+    monitor = SafeguardMonitor([entry])
+    monitor.start()
+    time.sleep(_SAMPLE_WINDOW_SEC)
+    monitor.stop()
+
+    obs = monitor.get_observations()[entry.name]
+    assert obs.armed is False
+    assert obs.error_count >= 2
+    assert obs.pre_arm_sample_count == 0
+
+
+def test_default_arm_on_is_unchanged_start_behaviour() -> None:
+    """Every entry authored before arm_on existed must behave exactly as before."""
+    entry = _hold_entry({"type": "sg_always_fail"}, hold_poll_interval_sec=_POLL_INTERVAL_SEC)
+    assert entry.arm_on is None
+    assert entry.arms_on_first_true is False
+
+    monitor = SafeguardMonitor([entry])
+    monitor.start()
+    time.sleep(_SAMPLE_WINDOW_SEC)
+    monitor.stop()
+
+    obs = monitor.get_observations()[entry.name]
+    assert obs.armed is True
+    assert obs.violated is True, "an arm_on-less entry still violates on the first failing sample"
+
+
+def test_arm_on_is_rejected_on_a_non_hold_entry() -> None:
+    """A silent no-op is how a misconfigured entry hides; reject it by name."""
+    _, errors = parse_entries(
+        [
+            {
+                "name": "e",
+                "role": "objective",
+                "mode": "converge",
+                "check": {"type": "sg_always_pass"},
+                "arm_on": "first_true",
+            }
+        ]
+    )
+    assert errors
+    assert any("arm_on is only valid when mode is 'hold'" in e["reason"] for e in errors)

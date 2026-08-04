@@ -324,6 +324,16 @@ class VerificationEntry(BaseModel):
             ``devops_bench.evalharness.safeguard_monitor``). Must be positive
             when set. Setting this on an entry whose mode is not ``hold`` is
             a validation error, since it would otherwise silently do nothing.
+        arm_on: When a ``hold`` entry starts counting failing samples.
+            ``"start"`` (the default, and the only behaviour before this
+            field existed) arms from the first sample, so the condition must
+            already be true when the agent's turn begins. ``"first_true"``
+            discards samples until the first PASSING one and arms from there,
+            which is how "bring this state about, then do not let it regress"
+            is expressed: an attain-then-hold row. An entry that is never
+            armed FAILS, because never attaining the state is not the same as
+            holding it. Ignored for every other mode, and setting it on one
+            is a validation error rather than a silent no-op.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -335,6 +345,7 @@ class VerificationEntry(BaseModel):
     weight: float = Field(default=1.0, gt=0)
     check: Any
     hold_poll_interval_sec: float | None = Field(default=None, gt=0)
+    arm_on: Literal["start", "first_true"] | None = None
 
     @field_validator("check", mode="before")
     @classmethod
@@ -349,10 +360,10 @@ class VerificationEntry(BaseModel):
     def _check_role_and_mode(self) -> VerificationEntry:
         """Enforce the role/severity pairing and the hold-field/mode coupling.
 
-        ``hold_poll_interval_sec`` only means something when ``mode`` is
-        explicitly ``"hold"``; setting it on any other entry is rejected by
-        name rather than silently ignored, since a silent no-op is exactly
-        how a misconfigured entry hides.
+        ``hold_poll_interval_sec`` and ``arm_on`` only mean something when
+        ``mode`` is explicitly ``"hold"``; setting either on any other entry
+        is rejected by name rather than silently ignored, since a silent
+        no-op is exactly how a misconfigured entry hides.
         """
         if self.role == "safeguard" and self.severity is None:
             raise ValueError("severity is required when role is 'safeguard'")
@@ -360,7 +371,19 @@ class VerificationEntry(BaseModel):
             raise ValueError("severity is not allowed when role is 'objective'")
         if self.mode != "hold" and self.hold_poll_interval_sec is not None:
             raise ValueError("hold_poll_interval_sec is only valid when mode is 'hold'")
+        if self.mode != "hold" and self.arm_on is not None:
+            raise ValueError("arm_on is only valid when mode is 'hold'")
         return self
+
+    @property
+    def arms_on_first_true(self) -> bool:
+        """Whether this entry defers arming until the condition first holds.
+
+        Defaulting here rather than at the field keeps ``arm_on: None``
+        meaning "not authored", which is what lets the validator above tell an
+        unset field from an explicit ``"start"``.
+        """
+        return self.arm_on == "first_true"
 
     @property
     def resolved_mode(self) -> str:
