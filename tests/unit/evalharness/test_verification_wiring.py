@@ -384,6 +384,42 @@ def test_resolve_spec_placeholders_recurses_through_nested_entries() -> None:
     assert checks[1]["selector"] == "app=web"
 
 
+def test_resolve_spec_placeholders_expands_bash_cluster_name_in_a_check_param() -> None:
+    harness = _harness()
+    raw = {"name": "${CLUSTER_NAME}-worker2"}
+
+    resolved = harness._resolve_spec_placeholders(raw, "kind", "web", "shop")
+
+    assert resolved["name"] == "kind-worker2"
+
+
+def test_resolve_spec_placeholders_expands_bash_cluster_name_in_an_expected_value() -> None:
+    harness = _harness()
+    raw = {"value": "${CLUSTER_NAME}-worker"}
+
+    resolved = harness._resolve_spec_placeholders(raw, "kind", "web", "shop")
+
+    assert resolved["value"] == "kind-worker"
+
+
+def test_resolve_spec_placeholders_expands_the_unbraced_bash_cluster_name_literal() -> None:
+    harness = _harness()
+    raw = {"value": "$CLUSTER_NAME-worker"}
+
+    resolved = harness._resolve_spec_placeholders(raw, "kind", "web", "shop")
+
+    assert resolved["value"] == "kind-worker"
+
+
+def test_resolve_spec_placeholders_leaves_unrelated_bash_variables_untouched() -> None:
+    harness = _harness()
+    raw = {"value": "${FOO}-${CLUSTER_NAME}"}
+
+    resolved = harness._resolve_spec_placeholders(raw, "kind", "web", "shop")
+
+    assert resolved["value"] == "${FOO}-kind"
+
+
 # --- hold-mode entries report from the monitor's observations, never fresh --------
 
 
