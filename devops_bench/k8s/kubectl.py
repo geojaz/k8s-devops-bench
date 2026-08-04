@@ -160,6 +160,7 @@ def get_resource(
     kubeconfig: KubeconfigSource = None,
     timeout: float | None = None,
     context: str | None = None,
+    ignore_not_found: bool = False,
 ) -> dict[str, Any]:
     """Fetch a resource (or list) as parsed JSON via ``kubectl get -o json``.
 
@@ -173,12 +174,22 @@ def get_resource(
             (the default) blocks indefinitely, so pass one whenever the API
             server might accept a connection and never respond.
         context: Optional kubeconfig context to pin the call to.
+        ignore_not_found: Pass ``--ignore-not-found`` so a missing ``name``
+            exits 0 with empty output instead of kubectl's usual non-zero
+            NotFound error. This is a structured signal from kubectl itself
+            (it only suppresses the not-found case; a real failure such as an
+            RBAC denial or an unreachable API server still raises normally),
+            letting a caller distinguish "does not exist" from a genuine
+            kubectl failure without parsing stderr. Only meaningful together
+            with ``name``.
 
     Returns:
-        The parsed JSON document.
+        The parsed JSON document, or ``{}`` when ``ignore_not_found`` is set
+        and the object does not exist.
 
     Raises:
-        SubprocessError: If kubectl exits non-zero or times out.
+        SubprocessError: If kubectl exits non-zero (for a reason other than
+            the object being absent under ``ignore_not_found``) or times out.
         json.JSONDecodeError: If the output is not valid JSON.
     """
     argv = [
@@ -190,8 +201,11 @@ def get_resource(
         "-o",
         "json",
         *_namespace_args(namespace),
+        *(["--ignore-not-found"] if ignore_not_found else []),
     ]
     completed = _run_kubectl(argv, kubeconfig, timeout=timeout, context=context)
+    if ignore_not_found and not completed.stdout.strip():
+        return {}
     return json.loads(completed.stdout)
 
 

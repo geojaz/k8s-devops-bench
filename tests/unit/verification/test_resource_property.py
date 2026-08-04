@@ -14,12 +14,16 @@
 
 """Unit tests for the resource_property verifier."""
 
+import json
+import subprocess
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
+from pytest_mock import MockerFixture
 
+from devops_bench.core.errors import SubprocessError
 from devops_bench.verification.spec import parse_node
 from devops_bench.verification.verifiers.resource_property import (
     ResourcePropertyVerifier,
@@ -1098,6 +1102,140 @@ def test_get_resource_is_called_with_a_floored_timeout(
     with patch(_GET, return_value=_deployment()) as mock_get:
         _verifier(op="exists", resource_name="web").verify(timeout_sec)
     assert mock_get.call_args.kwargs["timeout"] == expected_timeout
+
+
+# -- name-mode NotFound: absent/exists with no path -----------------------
+#
+# Regression: T-028, entry secret-absent@trust.secret. An `absent` check
+# with no `path` against a named object used to error out on kubectl's
+# NotFound instead of treating it as the success condition it is. These
+# drive the real `get_resource` through a faked ``kubectl`` runner (patching
+# ``devops_bench.k8s.kubectl.run``, the same seam ``test_k8s_kubectl.py``
+# uses) rather than mocking `get_resource` itself, so the
+# ``--ignore-not-found`` wiring is exercised end to end.
+
+
+def _kubectl_completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout)
+
+
+def _secret(name: str = "signing-key-v1", ns: str = "payments") -> dict[str, Any]:
+    return {"kind": "Secret", "metadata": {"name": name, "namespace": ns}}
+
+
+def test_absent_no_path_passes_when_kubectl_reports_not_found(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run", return_value=_kubectl_completed(stdout="")
+    )
+
+    result = _verifier(
+        kind="secret", op="absent", resource_name="signing-key-v1", namespace="payments"
+    ).verify(0.0)
+
+    assert result.success is True
+    assert result.status == "pass"
+    assert "signing-key-v1" in result.reason
+    assert "payments" in result.reason
+    assert "--ignore-not-found" in mock_run.call_args.args[0]
+
+
+def test_absent_no_path_fails_when_the_object_exists(mocker: MockerFixture) -> None:
+    mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_kubectl_completed(stdout=json.dumps(_secret())),
+    )
+
+    result = _verifier(
+        kind="secret", op="absent", resource_name="signing-key-v1", namespace="payments"
+    ).verify(0.0)
+
+    assert result.success is False
+    assert result.status == "fail"
+
+
+def test_absent_no_path_still_errors_on_a_non_not_found_kubectl_failure(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        side_effect=SubprocessError(["kubectl", "get", "secret"], returncode=1, stderr="Forbidden"),
+    )
+
+    result = _verifier(
+        kind="secret", op="absent", resource_name="signing-key-v1", namespace="payments"
+    ).verify(0.0)
+
+    assert result.status == "error"
+    assert "Forbidden" in result.reason
+
+
+def test_exists_no_path_fails_when_kubectl_reports_not_found(mocker: MockerFixture) -> None:
+    # Mirror-image of the `absent` bug: with no path, `exists` must FAIL on a
+    # genuine NotFound, not error out.
+    mocker.patch("devops_bench.k8s.kubectl.run", return_value=_kubectl_completed(stdout=""))
+
+    result = _verifier(
+        kind="secret", op="exists", resource_name="signing-key-v1", namespace="payments"
+    ).verify(0.0)
+
+    assert result.success is False
+    assert result.status == "fail"
+    assert "signing-key-v1" in result.reason
+
+
+def test_exists_no_path_passes_when_the_object_exists(mocker: MockerFixture) -> None:
+    mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_kubectl_completed(stdout=json.dumps(_secret())),
+    )
+
+    result = _verifier(
+        kind="secret", op="exists", resource_name="signing-key-v1", namespace="payments"
+    ).verify(0.0)
+
+    assert result.success is True
+    assert result.status == "pass"
+
+
+def test_exists_no_path_still_errors_on_a_non_not_found_kubectl_failure(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        side_effect=SubprocessError(
+            ["kubectl", "get", "secret"], returncode=1, stderr="connection refused"
+        ),
+    )
+
+    result = _verifier(
+        kind="secret", op="exists", resource_name="signing-key-v1", namespace="payments"
+    ).verify(0.0)
+
+    assert result.status == "error"
+    assert "connection refused" in result.reason
+
+
+def test_path_based_absent_does_not_use_ignore_not_found(mocker: MockerFixture) -> None:
+    # A `path`-scoped `absent` check is about a field missing inside an
+    # OBJECT THAT EXISTS, not the object itself: it must never suppress a
+    # real NotFound, so `--ignore-not-found` stays off the argv and this
+    # behaviour (a missing field inside an existing object) is unchanged.
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_kubectl_completed(stdout=json.dumps(_secret())),
+    )
+
+    result = _verifier(
+        kind="secret",
+        op="absent",
+        path="data.rotatedAt",
+        resource_name="signing-key-v1",
+        namespace="payments",
+    ).verify(0.0)
+
+    assert "--ignore-not-found" not in mock_run.call_args.args[0]
+    assert result.success is True
+    assert result.status == "pass"
 
 
 def test_converge_mode_polls_until_the_property_holds(monkeypatch: pytest.MonkeyPatch) -> None:

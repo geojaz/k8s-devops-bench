@@ -329,6 +329,66 @@ def test_run_pod_propagates_subprocess_error(mocker: MockerFixture) -> None:
         kubectl.run_pod("p", "busybox", ["true"])
 
 
+def test_get_resource_ignore_not_found_appends_the_flag(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout=json.dumps({"status": {"phase": "Running"}})),
+    )
+
+    kubectl.get_resource("secret", "signing-key-v1", namespace="payments", ignore_not_found=True)
+
+    argv = mock_run.call_args.args[0]
+    assert argv == [
+        "kubectl",
+        "get",
+        "secret",
+        "signing-key-v1",
+        "-o",
+        "json",
+        "-n",
+        "payments",
+        "--ignore-not-found",
+    ]
+
+
+def test_get_resource_ignore_not_found_with_empty_stdout_returns_empty_dict(
+    mocker: MockerFixture,
+) -> None:
+    # kubectl exits 0 with no stdout when --ignore-not-found suppresses the
+    # object's NotFound; that must not hit json.loads("") and raise.
+    mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed(stdout=""))
+
+    result = kubectl.get_resource("secret", "signing-key-v1", ignore_not_found=True)
+
+    assert result == {}
+
+
+def test_get_resource_without_ignore_not_found_omits_the_flag(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout=json.dumps({"status": {}})),
+    )
+
+    kubectl.get_resource("secret", "signing-key-v1")
+
+    assert "--ignore-not-found" not in mock_run.call_args.args[0]
+
+
+def test_get_resource_ignore_not_found_still_propagates_other_kubectl_failures(
+    mocker: MockerFixture,
+) -> None:
+    # --ignore-not-found only suppresses the NotFound case; a real failure
+    # (RBAC denial, unreachable API server, ...) must still raise, whether or
+    # not ignore_not_found was requested.
+    mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        side_effect=SubprocessError(["kubectl", "get", "secret"], returncode=1, stderr="Forbidden"),
+    )
+
+    with pytest.raises(SubprocessError):
+        kubectl.get_resource("secret", "signing-key-v1", ignore_not_found=True)
+
+
 def test_get_resource_propagates_invalid_json(mocker: MockerFixture) -> None:
     mocker.patch(
         "devops_bench.k8s.kubectl.run",
