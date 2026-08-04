@@ -211,6 +211,38 @@ def test_start_is_a_no_op_with_no_hold_entries() -> None:
     assert monitor.get_observations() == {}
 
 
+def test_sampling_thread_tags_subprocess_log_lines_as_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The monitor's own thread must be distinguishable from the agent's in the log.
+
+    Confirms the monitor's scheduling thread carries the ``core.subprocess``
+    thread-local tag by asserting the tag observed inside a verify() call made
+    from that thread, rather than by parsing log output here.
+    """
+    from devops_bench.core import subprocess as bench_subprocess
+
+    observed_tags: list[str | None] = []
+
+    @VERIFIERS.register("sg_capture_tag")
+    class _CaptureTag(BaseVerifier):
+        type: Literal["sg_capture_tag"] = "sg_capture_tag"
+
+        def verify(self, timeout_sec: float) -> VerificationResult:
+            observed_tags.append(getattr(bench_subprocess._thread_local, "tag", None))  # noqa: SLF001
+            return VerificationResult(success=True, elapsed_time=0.0, reason="held", name=self.name)
+
+    entry = _hold_entry({"type": "sg_capture_tag"}, hold_poll_interval_sec=_POLL_INTERVAL_SEC)
+    monitor = SafeguardMonitor([entry])
+    monitor.start()
+    time.sleep(_SAMPLE_WINDOW_SEC)
+    monitor.stop()
+
+    assert observed_tags
+    assert all(tag == "sample" for tag in observed_tags)
+    assert getattr(bench_subprocess._thread_local, "tag", None) is None  # noqa: SLF001
+
+
 def test_mode_hold_now_parses_instead_of_raising() -> None:
     """Was rejected outright at the schema level; hold now parses like any other mode."""
     entry = _hold_entry({"type": "sg_always_pass"})

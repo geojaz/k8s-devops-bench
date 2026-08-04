@@ -48,6 +48,7 @@ import time
 from dataclasses import dataclass
 
 from devops_bench.core import get_logger
+from devops_bench.core.subprocess import tag_current_thread
 from devops_bench.verification import VerificationEntry, VerifierAgent
 
 __all__ = ["HOLD_POLL_INTERVAL_SEC", "HoldObservation", "SafeguardMonitor"]
@@ -188,7 +189,16 @@ class SafeguardMonitor:
         bug in the scheduling logic itself (not just in one entry's sample)
         cannot kill the thread either. A monitor bug must never take down the
         task run.
+
+        Tags every ``core.subprocess.run`` call made from this thread as
+        ``[sample]`` in the log, so its periodic ``kubectl`` polling reads
+        distinctly from the agent's own subprocess activity. A thread-local
+        flag needs no plumbing through the sampling call chain (this loop ->
+        ``VerifierAgent.run_entry`` -> the leaf verifier -> ``get_resource``
+        -> ``core.subprocess.run``) to reach the log line; the whole chain
+        runs on this one dedicated thread for its entire lifetime.
         """
+        tag_current_thread("sample")
         next_due: dict[str, float] = dict.fromkeys((e.name for e in self._entries), 0.0)
         while not self._stop_event.is_set():
             try:
