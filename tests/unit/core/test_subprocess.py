@@ -19,7 +19,9 @@ These exercise the wrapper against real, portable shell-free commands
 the standard library.
 """
 
+import logging
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -115,6 +117,68 @@ def test_as_text_handles_bytes_and_none():
     assert bench_subprocess._as_text(None) is None
     assert bench_subprocess._as_text("text") == "text"
     assert isinstance(bench_subprocess._as_text(b"\xff\xfe"), str)
+
+
+def _api_key(char: str) -> str:
+    return "AIza" + char * 35
+
+
+def test_redact_masks_secret_env_values_and_preserves_benign_env():
+    key1 = _api_key("X")
+    key2 = _api_key("Y")
+    cmd = (
+        f"docker run --rm -e GEMINI_API_KEY={key1} "
+        f"-e GOOGLE_API_KEY={key2} -e BENIGN_VAR=hello image:tag"
+    )
+    redacted = bench_subprocess.redact(cmd)
+    assert key1 not in redacted
+    assert key2 not in redacted
+    assert "GEMINI_API_KEY=AIza****" in redacted
+    assert "GOOGLE_API_KEY=AIza****" in redacted
+    assert "BENIGN_VAR=hello" in redacted
+
+
+def test_redact_masks_bare_secret_shapes_outside_env_assignments():
+    key = _api_key("Z")
+    redacted = bench_subprocess.redact(f"curl https://example.com?key={key}")
+    assert key not in redacted
+    assert "AIza****" in redacted
+
+
+def test_redact_does_not_affect_the_executed_command():
+    key = _api_key("W")
+    result = bench_subprocess.run(["echo", f"MY_SECRET_TOKEN={key}"])
+    assert key in result.stdout
+
+
+def test_running_command_log_is_redacted(caplog: pytest.LogCaptureFixture):
+    key = _api_key("V")
+    cmd = ["echo", "-e", f"MY_SECRET_TOKEN={key}", "-e", "BENIGN=ok"]
+    with caplog.at_level(logging.DEBUG):
+        bench_subprocess.run(cmd, check=False)
+    assert key not in caplog.text
+    assert "MY_SECRET_TOKEN=AIza****" in caplog.text
+    assert "BENIGN=ok" in caplog.text
+
+
+def test_tag_current_thread_marks_the_log_line_only_for_that_thread(
+    caplog: pytest.LogCaptureFixture,
+):
+    def _tagged() -> None:
+        bench_subprocess.tag_current_thread("sample")
+        bench_subprocess.run(_py("print('from tagged thread')"))
+
+    with caplog.at_level(logging.DEBUG):
+        t = threading.Thread(target=_tagged)
+        t.start()
+        t.join()
+        bench_subprocess.run(_py("print('from main thread')"))
+
+    running_lines = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("running command")
+    ]
+    assert any(line.startswith("running command [sample]:") for line in running_lines)
+    assert any(line.startswith("running command:") for line in running_lines)
 
 
 def test_child_does_not_inherit_parent_stdin() -> None:
