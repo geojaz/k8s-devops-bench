@@ -420,18 +420,44 @@ class ResourcePropertyVerifier(BaseVerifier):
 
     def _check(self, timeout_sec: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         """One evaluation pass: fetch, resolve matches, apply the operator."""
+        target_name = self._target_name
+        # `absent`/`exists` with no `path` are set-membership checks over a
+        # single named object: "does this object exist or not" is exactly
+        # what kubectl's NotFound represents, not a check error. Scoped to
+        # name-mode (never selector, which already reports absence as an
+        # empty list rather than a kubectl error) and to the no-path set ops,
+        # so every other op's NotFound handling (an error, as before) is
+        # unchanged.
+        not_found_aware = (
+            self.selector is None
+            and target_name is not None
+            and self.path is None
+            and self.op in ("absent", "exists")
+        )
         try:
             payload = get_resource(
                 self.kind,
-                self._target_name,
+                target_name,
                 selector=self.selector,
                 namespace=self.namespace,
                 kubeconfig=self.kubeconfig,
                 context=self.context,
                 timeout=single_call_timeout(timeout_sec),
+                ignore_not_found=not_found_aware,
             )
         except Exception as exc:  # noqa: BLE001 - a kubectl failure is a check error
             return "error", f"kubectl get {self.kind} failed: {exc}", None
+
+        if not_found_aware and not payload:
+            raw = {"matched": 0, "names": []}
+            ns_desc = f" in {self.namespace}" if self.namespace else ""
+            if self.op == "absent":
+                return (
+                    "pass",
+                    f"{self.kind} {target_name} not found{ns_desc}, as required",
+                    raw,
+                )
+            return "fail", f"{self.kind} {target_name} not found{ns_desc}", raw
 
         items = payload.get("items")
         objects = items if isinstance(items, list) else [payload]
