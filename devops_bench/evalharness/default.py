@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime
 import importlib
 import json
+import re
 import threading
 import time
 from dataclasses import replace
@@ -112,6 +113,15 @@ _CHAOS_ACTIVE_WAIT_SEC = 45
 # so a slow-but-completing verification is not cut off, which would otherwise
 # yield partial reports and race teardown.
 _SCENARIO_JOIN_SEC = VERIFICATION_TIMEOUT_SEC + 60
+
+# The factory emits node/resource names as a bash variable-expansion literal
+# (``${CLUSTER_NAME}`` / ``$CLUSTER_NAME``) because the real cluster name is
+# unknown until the cluster exists. That literal expands fine when a task's
+# own bash artifacts run it through a shell, but verification_spec /
+# chaos_spec values are evaluated straight out of Python with no shell, so
+# the literal must be expanded here instead. Only this one variable name is
+# substituted; any other ``${...}`` / ``$...`` token is left untouched.
+_CLUSTER_NAME_ENV_RE = re.compile(r"\$\{CLUSTER_NAME\}|\$CLUSTER_NAME(?![A-Za-z0-9_])")
 
 
 def _ensure_builtin_agents_registered() -> None:
@@ -442,7 +452,11 @@ class DefaultEvalHarness(Harness):
         Substitution runs before parsing because a template string like
         ``{{NAMESPACE}}`` is not a valid value for a typed field, so
         placeholders are resolved on the raw payload before the caller parses
-        it into a typed structure.
+        it into a typed structure. Alongside the ``{{...}}`` placeholder
+        vocabulary, this also expands the bash-style ``${CLUSTER_NAME}`` /
+        ``$CLUSTER_NAME`` literal the factory emits for node/resource names,
+        since a spec value is evaluated straight out of Python with no shell
+        to expand it (see :data:`_CLUSTER_NAME_ENV_RE`).
 
         Args:
             spec: An opaque chaos / verification spec value (mapping, list,
@@ -457,7 +471,8 @@ class DefaultEvalHarness(Harness):
             unchanged so a missing spec stays missing.
         """
         if isinstance(spec, str):
-            return self.replace_placeholders(spec, cluster_name, target_deployment, namespace)
+            resolved = self.replace_placeholders(spec, cluster_name, target_deployment, namespace)
+            return _CLUSTER_NAME_ENV_RE.sub(cluster_name, resolved)
         if isinstance(spec, list):
             return [
                 self._resolve_spec_placeholders(item, cluster_name, target_deployment, namespace)
