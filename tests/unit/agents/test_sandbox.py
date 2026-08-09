@@ -160,6 +160,87 @@ def test_sweep_stray_containers_handles_docker_ps_failure_without_raising(
     sandbox.sweep_stray_containers()  # must not raise
 
 
+def test_docker_user_spec_in_range_returns_uid_gid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+    assert sandbox._docker_user_spec() == "1000:1000"
+
+
+def test_docker_user_spec_uid_above_ceiling_falls_back_to_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: sandbox._DOCKER_MAX_ID + 1)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+    assert sandbox._docker_user_spec() == "0:0"
+
+
+def test_docker_user_spec_gid_above_ceiling_falls_back_to_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: sandbox._DOCKER_MAX_ID + 1)
+    assert sandbox._docker_user_spec() == "0:0"
+
+
+def test_docker_user_spec_both_above_ceiling_falls_back_to_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: sandbox._DOCKER_MAX_ID + 1)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: sandbox._DOCKER_MAX_ID + 1)
+    assert sandbox._docker_user_spec() == "0:0"
+
+
+def test_docker_user_spec_boundary_max_id_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: sandbox._DOCKER_MAX_ID)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: sandbox._DOCKER_MAX_ID)
+    assert sandbox._docker_user_spec() == f"{sandbox._DOCKER_MAX_ID}:{sandbox._DOCKER_MAX_ID}"
+
+
+def test_docker_user_spec_boundary_one_above_max_id_falls_back_to_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: sandbox._DOCKER_MAX_ID + 1)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 0)
+    assert sandbox._docker_user_spec() == "0:0"
+
+
+def test_docker_user_spec_fallback_logs_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: sandbox._DOCKER_MAX_ID + 1)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: sandbox._DOCKER_MAX_ID + 1)
+    with caplog.at_level("WARNING"):
+        sandbox._docker_user_spec()
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert str(sandbox._DOCKER_MAX_ID + 1) in message
+    assert str(sandbox._DOCKER_MAX_ID) in message
+    assert "root" in message
+
+
+def test_docker_user_spec_in_range_does_not_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+    with caplog.at_level("WARNING"):
+        sandbox._docker_user_spec()
+    assert caplog.records == []
+
+
+def test_wrap_argv_uses_docker_user_spec_right_after_user_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "_docker_user_spec", lambda: "1000:1000")
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+    )
+    assert argv[argv.index("--user") + 1] == "1000:1000"
+
+
 def test_sweep_stray_containers_is_a_noop_when_none_are_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
