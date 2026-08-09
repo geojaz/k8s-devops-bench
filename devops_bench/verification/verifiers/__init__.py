@@ -14,6 +14,9 @@
 
 """Concrete single-condition verifiers."""
 
+from devops_bench.verification.verifiers.cloud_resource_property import (
+    CloudResourcePropertyVerifier,
+)
 from devops_bench.verification.verifiers.external_http_probe import ExternalHttpProbeVerifier
 from devops_bench.verification.verifiers.git_repo_sync import GitRepoSyncVerifier
 from devops_bench.verification.verifiers.http_probe import HttpProbeVerifier
@@ -28,6 +31,7 @@ from devops_bench.verification.verifiers.subject_access_review import (
 )
 
 __all__ = [
+    "CloudResourcePropertyVerifier",
     "ExternalHttpProbeVerifier",
     "GitRepoSyncVerifier",
     "HttpProbeVerifier",
