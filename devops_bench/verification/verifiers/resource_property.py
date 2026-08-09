@@ -421,19 +421,14 @@ class ResourcePropertyVerifier(BaseVerifier):
     def _check(self, timeout_sec: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         """One evaluation pass: fetch, resolve matches, apply the operator."""
         target_name = self._target_name
-        # `absent`/`exists` with no `path` are set-membership checks over a
-        # single named object: "does this object exist or not" is exactly
-        # what kubectl's NotFound represents, not a check error. Scoped to
-        # name-mode (never selector, which already reports absence as an
-        # empty list rather than a kubectl error) and to the no-path set ops,
-        # so every other op's NotFound handling (an error, as before) is
-        # unchanged.
-        not_found_aware = (
-            self.selector is None
-            and target_name is not None
-            and self.path is None
-            and self.op in ("absent", "exists")
-        )
+        # A single named object's absence is always a well-defined
+        # observation, not a check error: "does this object exist" for
+        # `absent`/`exists`, and "the object it would read from is gone" for
+        # every property-value op too (a deleted ResourceQuota cannot hold an
+        # `eq` on its spec any more than a present-but-wrong one can). Scoped
+        # to name-mode only; selector mode already reports absence as an
+        # empty list rather than a kubectl error, so it is left unchanged.
+        not_found_aware = self.selector is None and target_name is not None
         try:
             payload = get_resource(
                 self.kind,
@@ -455,6 +450,17 @@ class ResourcePropertyVerifier(BaseVerifier):
                 return (
                     "pass",
                     f"{self.kind} {target_name} not found{ns_desc}, as required",
+                    raw,
+                )
+            if self.path is not None:
+                # A property-value op (eq/ne/gt/gte/lt/lte/contains/matches):
+                # the object it would read `path` from does not exist, so the
+                # property cannot hold. This must FAIL, not error, so that
+                # deleting the guarded object is caught at least as reliably
+                # as patching it.
+                return (
+                    "fail",
+                    f"{self.kind}/{target_name} not found{ns_desc}; property check cannot hold",
                     raw,
                 )
             return "fail", f"{self.kind} {target_name} not found{ns_desc}", raw
