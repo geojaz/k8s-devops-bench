@@ -388,6 +388,94 @@ def test_run_one_collects_files_the_agent_writes_to_its_workspace(
         AGENTS._items.pop("fake-workspace-writer", None)  # noqa: SLF001
 
 
+def test_run_one_records_artifact_collection_failures_loudly_on_the_record(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial artifact collection must be visible on the run's own output,
+    not only in the log: this is the fix for the defect where a permission
+    error swallowed by a bare log line let a partially-collected run read
+    exactly like a complete one.
+    """
+    AGENTS.register("fake-workspace-writer-partial-collect")(_WorkspaceWritingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p",
+            cluster_name="c",
+            agent_type="fake-workspace-writer-partial-collect",
+            no_infra=True,
+        )
+
+        def _partial_collect(*_args: Any, **_kwargs: Any) -> Any:
+            return ["output.txt"], [{"name": ".kube", "error": "Permission denied: '.kube'"}]
+
+        monkeypatch.setattr(harness_default, "collect_generated_files", _partial_collect)
+
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+        run_dir = tmp_path / "run_1"
+        run_dir.mkdir()
+
+        record = harness._run_one(task, run_dir)  # noqa: SLF001
+
+        assert record["status"] == "success"
+        assert record["artifact_collection"]["complete"] is False
+        assert record["artifact_collection"]["failures"] == [
+            {"name": ".kube", "error": "Permission denied: '.kube'"}
+        ]
+    finally:
+        AGENTS._items.pop("fake-workspace-writer-partial-collect", None)  # noqa: SLF001
+
+
+def test_run_one_records_artifact_collection_complete_when_nothing_failed(
+    isolated_env: None, tmp_path: Path
+) -> None:
+    AGENTS.register("fake-workspace-writer-complete-collect")(_WorkspaceWritingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p",
+            cluster_name="c",
+            agent_type="fake-workspace-writer-complete-collect",
+            no_infra=True,
+        )
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+        run_dir = tmp_path / "run_1"
+        run_dir.mkdir()
+
+        record = harness._run_one(task, run_dir)  # noqa: SLF001
+
+        assert record["artifact_collection"] == {"complete": True, "failures": []}
+    finally:
+        AGENTS._items.pop("fake-workspace-writer-complete-collect", None)  # noqa: SLF001
+
+
+def test_run_one_marks_artifact_collection_not_attempted_when_execute_agent_raises(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash inside execute_agent happens before collect_generated_files is
+    ever reached, so the failed record's artifact_collection must say
+    collection was never attempted, not falsely claim it completed.
+
+    Regression test: complete previously defaulted to True via the empty
+    ``artifact_collection_failures`` list, making a run that lost its
+    transcript to an agent crash indistinguishable from a fully successful
+    collection.
+    """
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c", no_infra=True)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("agent process crashed")
+
+    monkeypatch.setattr(harness, "execute_agent", _boom)
+    task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+    run_dir = tmp_path / "run_1"
+    run_dir.mkdir()
+
+    record = harness._run_one(task, run_dir)  # noqa: SLF001
+
+    assert record["status"] == "failed"
+    assert record["artifact_collection"]["complete"] is None
+    assert record["artifact_collection"]["failures"] == []
+
+
 def test_run_one_survives_a_workspace_containment_bug_during_teardown(
     isolated_env: None,
     tmp_path: Path,
@@ -837,6 +925,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "verification_status",
         "generation_only",
         "validated",
+        "artifact_collection",
     }
 )
 

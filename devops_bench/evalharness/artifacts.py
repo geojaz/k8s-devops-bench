@@ -49,12 +49,23 @@ def collect_generated_files(
     run_dir: str | os.PathLike[str],
     *,
     source_dir: str | os.PathLike[str] = ".",
-) -> list[str]:
+) -> tuple[list[str], list[dict[str, str]]]:
     """Copy entries created since ``before`` into the run's artifact directory.
 
     New files and directories (those present now but absent from ``before``) are
     copied into ``<run_dir>/generated_files/``. The destination directory is
     created only when there is at least one new entry to copy.
+
+    Each top-level entry is copied independently, and a failure on one (for
+    example a permission error on a directory a sandboxed agent's container
+    left behind with restrictive mode bits) does not stop the rest from being
+    attempted: ``new_entries`` iterates a ``set``, whose order is not
+    guaranteed, so previously a single bad entry could silently swallow every
+    entry that happened to sort after it, including ones that copied cleanly.
+    That failure mode is exactly what dropped a run's Gemini session
+    transcript while a `.kube` cache directory the operator could not read
+    aborted collection before the transcript's own directory was ever
+    attempted.
 
     Args:
         before: Entry names captured by :func:`snapshot_dir` prior to the run.
@@ -68,33 +79,50 @@ def collect_generated_files(
             harness process's cwd.
 
     Returns:
-        The names of the entries that were copied.
+        A ``(copied, failures)`` pair. ``copied`` is the names of the entries
+        that were copied. ``failures`` is one ``{"name": ..., "error": ...}``
+        dict per entry that raised while being copied, so the caller can
+        record the collection as incomplete instead of only logging it.
     """
     after = snapshot_dir(source_dir)
     new_entries = after - before
     if not new_entries:
-        return []
+        return [], []
 
     gen_files_dir = Path(run_dir) / "generated_files"
     gen_files_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[str] = []
+    failures: list[dict[str, str]] = []
     src_root = os.fspath(source_dir)
     for name in new_entries:
         src = os.path.join(src_root, name)
         dst = os.fspath(gen_files_dir / name)
-        # An agent could plant a symlink pointing outside the workspace; following
-        # it would copy host files/credentials into the run artifacts. Skip links
-        # at the top level and preserve (don't follow) any nested ones.
-        if os.path.islink(src):
-            _log.warning("skipping symlinked artifact %s", src)
-            continue
-        if os.path.isdir(src):
-            shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
-            copied.append(name)
-        elif os.path.isfile(src):
-            shutil.copy(src, dst)
-            copied.append(name)
+        try:
+            # An agent could plant a symlink pointing outside the workspace;
+            # following it would copy host files/credentials into the run
+            # artifacts. Skip links at the top level and preserve (don't
+            # follow) any nested ones.
+            if os.path.islink(src):
+                _log.warning("skipping symlinked artifact %s", src)
+                continue
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
+                copied.append(name)
+            elif os.path.isfile(src):
+                shutil.copy(src, dst)
+                copied.append(name)
+        except OSError as exc:  # noqa: BLE001 - one bad entry must not sink the rest
+            _log.error("failed to collect artifact %s: %s", src, exc)
+            failures.append({"name": name, "error": str(exc)})
 
+    if failures:
+        _log.error(
+            "%d of %d generated artifact(s) failed to collect into %s: %s",
+            len(failures),
+            len(new_entries),
+            gen_files_dir,
+            [f["name"] for f in failures],
+        )
     _log.info("collected %d generated artifact(s) into %s", len(copied), gen_files_dir)
-    return copied
+    return copied, failures
