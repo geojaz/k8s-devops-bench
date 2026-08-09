@@ -47,6 +47,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from devops_bench.core import get_logger
+from devops_bench.core.errors import SubprocessError
 from devops_bench.core.subprocess import run
 
 __all__ = [
@@ -80,8 +81,13 @@ _CONTAINER_NAME_PREFIX = "devops-bench-agent-"
 # Docker rejects, rather than clamps, a --user outside int32 range.
 _DOCKER_MAX_ID = 2147483647
 
+# Grace period after SIGTERM before escalating to SIGKILL on container teardown.
+# Mirrors the port-forward teardown grace period in k8s.kubectl
+# (_PORT_FORWARD_TERM_GRACE_SEC).
+_CONTAINER_TERM_GRACE_SEC = 5
 
-def _docker_user_spec() -> str:
+
+def _docker_user_spec() -> tuple[str, bool, int, int]:
     """uid:gid for `docker run --user`, falling back to root when the
     operator's ids are outside Docker's accepted range.
 
@@ -90,19 +96,30 @@ def _docker_user_spec() -> str:
     rather than clamping. Falling back to root keeps the container the
     isolation boundary, which is what this wrapper actually relies on: the
     repository, HOME, the Docker socket and ADC are all still unmounted.
-    Cleanup still works because the run workspace directory is owned by the
-    operator, so root-owned files inside it remain unlinkable.
+
+    Returns a ``(spec, ran_as_root, uid, gid)`` tuple. ``ran_as_root`` tells
+    :func:`wrap_argv` whether it must also arrange to hand workspace
+    ownership back to the operator before the container exits: a root
+    process inside the container writes files into the bind-mounted
+    workspace as host uid/gid 0, and tools like ``kubectl`` and the Gemini
+    CLI create some of their own state directories mode 0700/0750, which
+    the (non-root) operator can then no longer read back on the host side.
+    See :func:`wrap_argv` for how that ownership is reclaimed. ``uid``/``gid``
+    are the operator's own resolved ids (never ``0:0``, even when
+    ``ran_as_root`` is True), so callers needing the chown-back target reuse
+    this function's own resolution instead of calling ``os.getuid()``/
+    ``os.getgid()`` a second time.
     """
     uid, gid = os.getuid(), os.getgid()
     if 0 <= uid <= _DOCKER_MAX_ID and 0 <= gid <= _DOCKER_MAX_ID:
-        return f"{uid}:{gid}"
+        return f"{uid}:{gid}", False, uid, gid
     _log.warning(
         "operator uid:gid %d:%d exceeds Docker's max id %d; running container as root",
         uid,
         gid,
         _DOCKER_MAX_ID,
     )
-    return "0:0"
+    return "0:0", True, uid, gid
 
 
 def sandbox_enabled() -> bool:
@@ -291,6 +308,24 @@ def wrap_argv(
       credential scoped to model access; ADC is the operator's whole cloud identity
       and is a larger grant than the filesystem access this wrapper removes.
 
+    When the operator's uid/gid is out of Docker's accepted range (see
+    :func:`_docker_user_spec`), the container runs as root, and the command is
+    wrapped in a small ``sh -c`` shim that ``chown -R``s ``/workspace`` back to
+    the operator's uid/gid via an EXIT trap. That trap fires on a clean exit, a
+    non-zero exit, or any trappable signal, SIGTERM included, so a container
+    torn down through :func:`kill_container`'s normal SIGTERM path still hands
+    ownership back. It does NOT fire on SIGKILL: SIGKILL cannot be caught by a
+    shell trap, so a container that has to be escalated all the way to SIGKILL
+    (see :func:`kill_container`) still loses the chown-back and leaves
+    ``/workspace`` root-owned. Root inside the container can ``chown`` to any
+    uid, including one outside Docker's own ``--user`` validation range,
+    because that ceiling is a client/daemon argument-parsing limitation, not a
+    kernel one; the raw ``chown(2)`` syscall accepts the full uid range.
+    Without this, files a root process creates (some of them mode 0700/0750,
+    e.g. ``kubectl``'s and the Gemini CLI's own cache/log directories) are
+    unreadable by the operator once the container exits, and the host-side
+    artifact collector silently loses them.
+
     Args:
         container_name: When given, passed as ``--name``, giving the running
             container a deterministic identity a caller can reap by name (see
@@ -313,6 +348,19 @@ def wrap_argv(
 
     name_flags = ["--name", container_name] if container_name else []
 
+    user_spec, ran_as_root, uid, gid = _docker_user_spec()
+    command = list(argv)
+    if ran_as_root:
+        # Root can chown to any uid/gid, including one Docker's own --user flag
+        # refused (see _docker_user_spec). Reclaim the workspace for the
+        # operator on a clean exit, a non-zero exit, or a trappable signal
+        # (SIGTERM included), not only a clean exit. "$@" (after "--") is the
+        # original argv untouched; the trap runs after it returns or the shell
+        # is signalled. SIGKILL cannot be trapped, so this does not cover
+        # kill_container's SIGKILL escalation; see the docstring above.
+        chown_back = f"trap 'chown -R {uid}:{gid} /workspace' EXIT; \"$@\""
+        command = ["sh", "-c", chown_back, "--", *argv]
+
     return [
         # No -i. Keeping stdin open gives the agent an open, non-TTY stdin to block
         # on, and a headless `-p <prompt>` run never reads it. Combined with
@@ -324,7 +372,7 @@ def wrap_argv(
         "--network",
         "kind",
         "--user",
-        _docker_user_spec(),
+        user_spec,
         "-v",
         f"{workspace}:/workspace",
         "-v",
@@ -337,7 +385,7 @@ def wrap_argv(
         "/workspace",
         *env_flags,
         image,
-        *argv,
+        *command,
     ]
 
 
@@ -353,7 +401,7 @@ def container_name_for_workspace(workspace: Path) -> str:
 
 
 def kill_container(name: str) -> None:
-    """Best-effort ``docker kill`` by name. Never raises.
+    """Best-effort ``docker kill`` by name, SIGTERM first. Never raises.
 
     ``--rm`` only removes a container once *the container's own process*
     exits; a ``docker run`` client killed out from under it (which is exactly
@@ -364,9 +412,36 @@ def kill_container(name: str) -> None:
     happened to the local ``docker run`` process. A container that is already
     gone (the common case, when the agent exited cleanly and ``--rm`` already
     reaped it) fails harmlessly.
+
+    Sends SIGTERM first and only escalates to SIGKILL if the container is
+    still running after :data:`_CONTAINER_TERM_GRACE_SEC`: a bare
+    ``docker kill`` sends SIGKILL, which cannot be caught by the ``sh -c EXIT``
+    trap :func:`wrap_argv` installs for a root-fallback run, so jumping
+    straight to SIGKILL was skipping that trap on exactly the path (a
+    timed-out or hung agent) it exists to cover. Mirrors the SIGTERM-then-
+    SIGKILL escalation in ``k8s.kubectl``'s port-forward teardown.
     """
-    result = run(["docker", "kill", name], check=False)
-    if result.returncode == 0:
+    result = run(["docker", "kill", "--signal=TERM", name], check=False)
+    if result.returncode != 0:
+        # Already gone (the common case) or the daemon errored; nothing
+        # further to do either way.
+        return
+
+    try:
+        # `docker wait` blocks until the container's own process exits,
+        # mirroring how kubectl.py's port-forward teardown blocks on
+        # process.wait(timeout=...) after terminate().
+        run(["docker", "wait", name], check=False, timeout=_CONTAINER_TERM_GRACE_SEC)
+    except SubprocessError:
+        _log.warning("sandbox container %s ignored SIGTERM, escalating to SIGKILL", name)
+        run(["docker", "kill", name], check=False)
+        try:
+            run(["docker", "wait", name], check=False, timeout=_CONTAINER_TERM_GRACE_SEC)
+        except SubprocessError:
+            _log.error("sandbox container %s survived SIGKILL; abandoning it", name)
+        else:
+            _log.info("reaped sandbox container %s", name)
+    else:
         _log.info("reaped sandbox container %s", name)
 
 

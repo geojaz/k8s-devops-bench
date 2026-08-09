@@ -899,6 +899,19 @@ class DefaultEvalHarness(Harness):
         workspace_path: Path | None = None
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
+        # Populated after the agent's turn; stays empty when no generated
+        # files were collected or the collection ran clean. Threaded into
+        # both the success and failed records so a partially-collected run's
+        # own output artifact records that fact, rather than only the log
+        # (see the collect_generated_files call site below).
+        artifact_collection_failures: list[dict[str, str]] = []
+        # False until the collect_generated_files call below is actually
+        # reached. execute_agent() can raise (agent crash, timeout, SDK
+        # fault) before that point, in which case collection never ran at
+        # all: distinct from "ran and found nothing wrong", and the failed
+        # record must say so rather than defaulting to a falsely complete
+        # artifact_collection field.
+        artifact_collection_attempted = False
         # Track the substituted prompt / expectation / safety checklists as they
         # are computed so a failed record can carry the same resolved strings a
         # success record would, falling back to the raw task fields before
@@ -1021,11 +1034,19 @@ class DefaultEvalHarness(Harness):
             # Consider a more targeted filter in a future iteration.
             # Best-effort: a collection failure (I/O, permissions, a bad link in the
             # workspace) must not turn an already-completed agent run into a failed,
-            # unscored record, so isolate it like the other non-critical steps.
+            # unscored record, so isolate it like the other non-critical steps. The
+            # outcome (which entries failed, if any) is still recorded on the result
+            # below: a run whose evidence is partially missing must not be
+            # indistinguishable, in the run's own output, from one that collected
+            # cleanly (see ``artifact_collection`` on the record).
             try:
-                collect_generated_files(before_files, run_dir, source_dir=workspace_path)
-            except Exception:  # noqa: BLE001 - artifact collection must not sink a completed run
+                artifact_collection_attempted = True
+                _, artifact_collection_failures = collect_generated_files(
+                    before_files, run_dir, source_dir=workspace_path
+                )
+            except Exception as exc:  # noqa: BLE001 - artifact collection must not sink a completed run
                 _log.exception("artifact collection failed for %s; continuing", task.name)
+                artifact_collection_failures = [{"name": "<unknown>", "error": str(exc)}]
 
             expected_output = self.replace_placeholders(
                 task.expected_output, active_cluster_name, target_dep, ns
@@ -1060,6 +1081,7 @@ class DefaultEvalHarness(Harness):
                 verification_report=verification_report,
                 verification_status=verification_status,
                 recoverable_safety=recoverable_safety,
+                artifact_collection_failures=artifact_collection_failures,
             )
             _log.info("agent response for %s:\n%s", task.name, result["output"])
         except Exception as exc:  # noqa: BLE001 - surface every task failure
@@ -1115,6 +1137,8 @@ class DefaultEvalHarness(Harness):
                 verification_parse_errors=verification_parse_errors,
                 verification_report=exception_verification_report,
                 verification_status=exception_verification_status,
+                artifact_collection_failures=artifact_collection_failures,
+                artifact_collection_attempted=artifact_collection_attempted,
             )
         finally:
             if scenario_manager is not None:
@@ -1168,6 +1192,7 @@ class DefaultEvalHarness(Harness):
         verification_report: list[dict[str, Any]] | None = None,
         verification_status: str = "evaluated",
         recoverable_safety: list[str] | None = None,
+        artifact_collection_failures: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Shape a typed :class:`AgentResult` + reports into the on-disk schema.
 
@@ -1237,6 +1262,11 @@ class DefaultEvalHarness(Harness):
                 "verification_parse_errors": list(verification_parse_errors or []),
                 "verification_report": list(verification_report or []),
                 "verification_status": verification_status,
+                # A success record is only ever built after collect_generated_files
+                # has run (see _run_one), so collection is always attempted here.
+                "artifact_collection": self._artifact_collection_field(
+                    artifact_collection_failures, attempted=True
+                ),
             }
         )
         return record
@@ -1252,6 +1282,8 @@ class DefaultEvalHarness(Harness):
         verification_parse_errors: list[dict[str, str]] | None = None,
         verification_report: list[dict[str, Any]] | None = None,
         verification_status: str = "not_evaluated",
+        artifact_collection_failures: list[dict[str, str]] | None = None,
+        artifact_collection_attempted: bool = False,
     ) -> dict[str, Any]:
         """Build a failed-task record so the failure stays visible.
 
@@ -1279,6 +1311,14 @@ class DefaultEvalHarness(Harness):
                 "parse_error" when the spec partially or fully failed to
                 parse, "not_evaluated" when it could not run,
                 "skipped_no_infra" under ``no_infra``.
+            artifact_collection_attempted: Whether collect_generated_files was
+                actually reached before the failure. Defaults to False, the
+                common case: most exception paths (deployer.up() raising,
+                execute_agent crashing) never get as far as collection. A
+                caller that failed after collection ran must pass True so the
+                record's ``artifact_collection`` is not misread as "never
+                ran" when it actually ran and failed, or as "complete" when
+                it never ran at all.
         """
         error_text = str(exc)
         record = self._empty_record(task)
@@ -1301,9 +1341,41 @@ class DefaultEvalHarness(Harness):
                 "verification_parse_errors": list(verification_parse_errors or []),
                 "verification_report": list(verification_report or []),
                 "verification_status": verification_status,
+                "artifact_collection": self._artifact_collection_field(
+                    artifact_collection_failures, attempted=artifact_collection_attempted
+                ),
             }
         )
         return record
+
+    @staticmethod
+    def _artifact_collection_field(
+        failures: list[dict[str, str]] | None,
+        *,
+        attempted: bool,
+    ) -> dict[str, Any]:
+        """Build the record's ``artifact_collection`` field.
+
+        Making a partial artifact collection loud in the run's own output
+        (not only in a log line) is the point: ``complete`` is False whenever
+        even one generated-file entry failed to copy, so a downstream
+        consumer scoring or reviewing this run can tell a partial artifact
+        set apart from a complete one without re-reading the harness log.
+        This is deliberately not fatal to the run: the agent's turn already
+        completed, and a run whose artifacts are partially missing should
+        still score, just not be mistaken for one with complete evidence.
+
+        ``attempted=False`` is a distinct third state from either outcome
+        above: collection never ran at all (e.g. the agent crashed before
+        reaching it), so there is nothing to report either way. ``complete``
+        is ``None`` in that case, never ``True``, so it cannot be misread as
+        a clean collection, and never ``False`` either, since that would
+        misreport an actual collection failure that never happened.
+        """
+        failures = list(failures or [])
+        if not attempted:
+            return {"complete": None, "failures": failures}
+        return {"complete": not failures, "failures": failures}
 
     def _empty_record(self, task: Task) -> dict[str, Any]:
         """Seed every record with the symmetric key set.
@@ -1349,6 +1421,11 @@ class DefaultEvalHarness(Harness):
             "verification_parse_errors": [],
             "verification_report": [],
             "verification_status": "",
+            # Overwritten by _artifact_collection_field once _build_success_record
+            # or _build_failed_record runs; this seed value keeps the key present
+            # and honestly "unknown" (complete=None, not falsely True) for any
+            # record shape built before that point.
+            "artifact_collection": {"complete": None, "failures": []},
             # Generation-only tasks have no cluster, so the OutcomeValidity judge
             # must not penalize them for "not applying". This holds both when the
             # task declares ``deployer: noop`` and when ``BENCH_NO_INFRA`` skips
