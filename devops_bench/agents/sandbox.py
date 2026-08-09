@@ -77,6 +77,33 @@ TOKEN_DURATION = os.environ.get("BENCH_AGENT_TOKEN_DURATION", "2h")
 # not start.
 _CONTAINER_NAME_PREFIX = "devops-bench-agent-"
 
+# Docker rejects, rather than clamps, a --user outside int32 range.
+_DOCKER_MAX_ID = 2147483647
+
+
+def _docker_user_spec() -> str:
+    """uid:gid for `docker run --user`, falling back to root when the
+    operator's ids are outside Docker's accepted range.
+
+    Directory-backed identity services (GCE OS Login, LDAP, AD) hand out
+    uids above Docker's int32 ceiling, and Docker rejects the whole run
+    rather than clamping. Falling back to root keeps the container the
+    isolation boundary, which is what this wrapper actually relies on: the
+    repository, HOME, the Docker socket and ADC are all still unmounted.
+    Cleanup still works because the run workspace directory is owned by the
+    operator, so root-owned files inside it remain unlinkable.
+    """
+    uid, gid = os.getuid(), os.getgid()
+    if 0 <= uid <= _DOCKER_MAX_ID and 0 <= gid <= _DOCKER_MAX_ID:
+        return f"{uid}:{gid}"
+    _log.warning(
+        "operator uid:gid %d:%d exceeds Docker's max id %d; running container as root",
+        uid,
+        gid,
+        _DOCKER_MAX_ID,
+    )
+    return "0:0"
+
 
 def sandbox_enabled() -> bool:
     """True when the agent should run containerised.
@@ -297,7 +324,7 @@ def wrap_argv(
         "--network",
         "kind",
         "--user",
-        f"{os.getuid()}:{os.getgid()}",
+        _docker_user_spec(),
         "-v",
         f"{workspace}:/workspace",
         "-v",
