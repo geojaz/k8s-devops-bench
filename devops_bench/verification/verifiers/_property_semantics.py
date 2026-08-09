@@ -222,14 +222,16 @@ def _apply_op(op: str, actual: Any, expected: Any) -> tuple[bool, str]:
     return False, f"unhandled op {op!r}"
 
 
-def apply_check(op: str, expected: Any, value: Any) -> tuple[bool, str]:
+def apply_check(op: str, expected: Any, value: Any, path: str | None) -> tuple[bool, str]:
     """Apply ``op`` to one resolved value against ``expected``.
 
     ``exists`` is trivially satisfied by any resolved value — the resolution
-    itself is the check; every other op delegates to :func:`_apply_op`.
+    itself is the check, and ``path`` is only threaded through to name what
+    was resolved in the reason string; every other op ignores ``path`` and
+    delegates to :func:`_apply_op`.
     """
     if op == "exists":
-        return True, f"resolved to {value!r}"
+        return True, f"path {path!r} resolved to {value!r}"
     return _apply_op(op, value, expected)
 
 
@@ -328,6 +330,7 @@ def evaluate_across_elements(
     suffix: _JsonPath,
     names: list[str],
     objects: list[Any],
+    path: str | None,
 ) -> list[tuple[bool, str]]:
     """Quantify ``mode`` over ``prefix``'s elements, not ``suffix``'s values.
 
@@ -337,7 +340,8 @@ def evaluate_across_elements(
     ``none``: an element that does not resolve ``suffix`` trivially conforms;
     no resolved value may satisfy ``op``. Returns one ``(ok, reason)`` pair
     per element, naming it by owning object and jsonpath ``full_path`` so an
-    element-wise failure is never invisible.
+    element-wise failure is never invisible. ``path`` is only threaded
+    through to :func:`apply_check` for its ``exists`` reason string.
     """
     suffix_str = _render_path(suffix)
     evaluations: list[tuple[bool, str]] = []
@@ -353,7 +357,7 @@ def evaluate_across_elements(
                         (True, f"{label} did not resolve {suffix_str} (trivially conforms)")
                     )
                 continue
-            op_results = [apply_check(op, expected, value) for value in resolved]
+            op_results = [apply_check(op, expected, value, path) for value in resolved]
             ok = (
                 all(r for r, _ in op_results)
                 if mode == "every"
@@ -407,7 +411,7 @@ def evaluate_matched_objects(
     if wildcard_split is not None:
         prefix, suffix = wildcard_split
         evaluations = evaluate_across_elements(
-            op, expected, across_matches, prefix, suffix, names, objects
+            op, expected, across_matches, prefix, suffix, names, objects, path
         )
         raw["path_matches"] = len(evaluations)
         if not evaluations:
@@ -477,7 +481,7 @@ def evaluate_matched_objects(
         )
         return "fail", reason, raw
 
-    results = [apply_check(op, expected, value) for _, value in flat]
+    results = [apply_check(op, expected, value, path) for _, value in flat]
     if across_matches == "every":
         success = all(ok for ok, _ in results)
         violating = {i for i, (ok, _) in enumerate(results) if not ok}
