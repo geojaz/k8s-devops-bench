@@ -225,6 +225,54 @@ def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.metadata.get("returncode") == 2
 
 
+def test_execute_classifies_sigkill_exit_as_signal_death(monkeypatch: pytest.MonkeyPatch) -> None:
+    """returncode 137 = 128+9 (SIGKILL): must be distinguishable from an
+    ordinary agent-side non-zero exit, not just prose in the error string.
+    This is exactly the shape produced when the sandbox sweep kills a
+    sibling run's container out from under the agent."""
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(stdout="", stderr="", returncode=137)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    assert result.has_errors()
+    assert result.metadata.get("returncode") == 137
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 9
+    assert signal_death["signal_name"] == "SIGKILL"
+    assert any("signal" in e.lower() for e in result.errors)
+
+
+def test_execute_classifies_sigterm_exit_as_signal_death(monkeypatch: pytest.MonkeyPatch) -> None:
+    """returncode 143 = 128+15 (SIGTERM)."""
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(stdout="", stderr="", returncode=143)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 15
+    assert signal_death["signal_name"] == "SIGTERM"
+
+
+def test_execute_ordinary_non_zero_exit_is_not_a_signal_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 128+N convention must not misfire on an ordinary agent-side
+    failure exit code that happens to be nonzero but well below 128."""
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(stdout="", stderr="boom", returncode=2)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    assert result.metadata.get("signal_death") is None
+
+
 def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         raise SubprocessError(argv, returncode=-1, stdout="", stderr="timeout")
