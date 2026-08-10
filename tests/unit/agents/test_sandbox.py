@@ -48,6 +48,44 @@ def test_wrap_argv_includes_name_flag_when_container_name_given() -> None:
     assert argv[argv.index("--name") + 1] == "devops-bench-agent-ws"
 
 
+def test_wrap_argv_never_puts_extra_env_values_in_argv() -> None:
+    """The structural fix: a secret handed in via extra_env must never appear
+    as a value anywhere in the returned argv, only its NAME. This is what
+    makes the value unreachable by string-formatting the command, independent
+    of any redaction layer."""
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+        extra_env={"GEMINI_API_KEY": secret, "GOOGLE_API_KEY": secret, "GEMINI_MODEL": "pro"},
+    )
+    assert secret not in " ".join(argv)
+    assert "pro" not in argv  # even a non-secret extra_env value stays out of argv
+
+
+def test_wrap_argv_emits_bare_dash_e_flag_per_extra_env_key() -> None:
+    """Each extra_env key becomes a bare `-e KEY` (no `=value`): this is what
+    tells `docker run` to forward the value from its own client process
+    environment into the container, rather than taking it from argv."""
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+        extra_env={"GEMINI_API_KEY": "whatever", "GEMINI_MODEL": "pro"},
+    )
+    assert "-e" in argv
+    e_indices = [i for i, arg in enumerate(argv) if arg == "-e"]
+    flag_values = [argv[i + 1] for i in e_indices]
+    assert "GEMINI_API_KEY" in flag_values
+    assert "GEMINI_MODEL" in flag_values
+    # bare, not `KEY=value`
+    assert "GEMINI_API_KEY=whatever" not in argv
+    assert "GEMINI_MODEL=pro" not in argv
+
+
 def test_wrap_argv_omits_name_flag_when_none_given() -> None:
     argv = sandbox.wrap_argv(
         ["gemini", "-p", "hi"],

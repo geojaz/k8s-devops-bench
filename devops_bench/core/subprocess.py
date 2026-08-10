@@ -17,13 +17,13 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import threading
 from collections.abc import Mapping, Sequence
 from typing import IO
 
 from devops_bench.core.errors import SubprocessError
+from devops_bench.core.errors import redact as redact
 from devops_bench.core.logging import get_logger
 
 __all__ = ["run", "redact", "tag_current_thread", "CompletedProcess"]
@@ -32,58 +32,13 @@ type CompletedProcess = subprocess.CompletedProcess[str]
 
 _log = get_logger("core.subprocess")
 
-# Names that mark an env-var assignment's value as secret-shaped, regardless
-# of provider (GEMINI_API_KEY, GOOGLE_API_KEY, ANTHROPIC_API_KEY, ...).
-_SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
-
-# `NAME=value` assignments, whether standalone (`FOO=bar cmd`) or following a
-# docker-style `-e` flag (`-e FOO=bar`): both render as the same substring in
-# the space-joined command string this module logs.
-_ENV_ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
-
-# Bare secret shapes to catch even outside an env-var assignment, e.g. a key
-# embedded in a URL or CLI flag value. Google API keys today; extend as other
-# providers' key shapes turn up in a logged command.
-_BARE_SECRET_PATTERNS = [re.compile(r"AIza[0-9A-Za-z_-]{35}")]
+# redact() itself now lives in devops_bench.core.errors: SubprocessError's own
+# message construction needs it too, and errors.py has no dependency on this
+# module, so it is the shared home without a circular import. Re-exported here
+# (via the `as redact` import above and __all__) so existing callers of
+# `devops_bench.core.subprocess.redact` keep working unchanged.
 
 _thread_local = threading.local()
-
-
-def _mask(value: str) -> str:
-    return f"{value[:4]}****"
-
-
-def redact(cmd_str: str) -> str:
-    """Mask secret-shaped values in a rendered command string, for logging only.
-
-    Never apply this to the command actually executed; it exists solely to
-    keep secrets out of log output.
-
-    Masks two things:
-        * The value of any ``NAME=value`` assignment (bare or after ``-e``)
-          whose name matches a secret pattern (KEY, TOKEN, SECRET, PASSWORD,
-          CREDENTIAL, case-insensitive).
-        * Any bare token matching a known secret key shape, whether or not it
-          appears in a ``NAME=value`` assignment.
-
-    Args:
-        cmd_str: The space-joined command string about to be logged.
-
-    Returns:
-        The same string with secret-shaped values masked, preserving a
-        4-character prefix (e.g. ``AIza****``).
-    """
-
-    def _replace_env(match: re.Match[str]) -> str:
-        name, value = match.group(1), match.group(2)
-        if _SECRET_NAME_RE.search(name):
-            return f"{name}={_mask(value)}"
-        return match.group(0)
-
-    redacted = _ENV_ASSIGNMENT_RE.sub(_replace_env, cmd_str)
-    for pattern in _BARE_SECRET_PATTERNS:
-        redacted = pattern.sub(lambda m: _mask(m.group(0)), redacted)
-    return redacted
 
 
 def tag_current_thread(tag: str | None) -> None:

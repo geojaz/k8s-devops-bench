@@ -25,6 +25,7 @@ from devops_bench.core.errors import (
     NotRegisteredError,
     RegistryError,
     SubprocessError,
+    redact,
 )
 
 
@@ -98,3 +99,54 @@ def test_subprocess_error_captures_streams():
     assert "kubectl get pods" in rendered
     assert "exit code 1" in rendered
     assert "boom" in rendered
+
+
+def test_subprocess_error_redacts_secret_shaped_value_in_command():
+    """A `docker run ... -e GEMINI_API_KEY=<value> ...` failure must never put
+    the value in the exception's own message: this is the exact leak this
+    harness put into results.json on a real run's failure path."""
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    cmd = ["docker", "run", "--rm", "-e", f"GEMINI_API_KEY={secret}", "image"]
+
+    err = SubprocessError(cmd, returncode=1, stdout="", stderr="")
+
+    rendered = str(err)
+    assert secret not in rendered
+    assert "GEMINI_API_KEY=" in rendered  # the name survives; only the value is masked
+    # cmd itself stays intact for programmatic use (e.g. a caller that wants
+    # to re-run it); only the string form is scrubbed.
+    assert err.cmd == cmd
+
+
+def test_subprocess_error_redacts_secret_shaped_value_in_stderr():
+    """stderr can echo the failing invocation (or another secret) just as
+    easily as argv does, so it needs the same treatment."""
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+
+    err = SubprocessError(
+        ["some-tool"], returncode=1, stdout="", stderr=f"auth failed for GOOGLE_API_KEY={secret}"
+    )
+
+    rendered = str(err)
+    assert secret not in rendered
+    assert "GOOGLE_API_KEY=" in rendered
+
+
+def test_subprocess_error_does_not_redact_benign_values():
+    """Redaction must not eat unrelated command text, or debugging a real
+    failure from results.json becomes impossible."""
+    err = SubprocessError(
+        ["kubectl", "get", "pods", "-n", "bench-system"], returncode=1, stdout="", stderr=""
+    )
+    rendered = str(err)
+    assert "kubectl get pods -n bench-system" in rendered
+
+
+def test_redact_masks_secret_shaped_env_assignment():
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    assert secret not in redact(f"GEMINI_API_KEY={secret}")
+    assert "GEMINI_API_KEY=" in redact(f"GEMINI_API_KEY={secret}")
+
+
+def test_redact_preserves_non_secret_assignments():
+    assert redact("BENIGN_VAR=hello world").startswith("BENIGN_VAR=hello")
