@@ -453,6 +453,123 @@ def test_agy_cli_agent_execute_flow_nonzero_exit_records_error_and_metadata(
 
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_flow_clean_exit_records_no_signal_death(
+    mock_run, mock_home, tmp_path
+):
+    mock_home.return_value = tmp_path
+    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="Success", stderr="")
+
+    def side_effect(*args, **kwargs):
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path)
+        return mock_run.return_value
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+    )
+    result = agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert result.errors == []
+    assert result.metadata.get("signal_death") is None
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_flow_ordinary_non_zero_exit_is_not_a_signal_death(
+    mock_run, mock_home, tmp_path
+):
+    # The 128+N convention must not misfire on an ordinary agent-side failure
+    # exit code that happens to be nonzero but well below 128.
+    mock_home.return_value = tmp_path
+    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=1, stdout="", stderr="boom")
+
+    def side_effect(*args, **kwargs):
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path)
+        return mock_run.return_value
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+    )
+    result = agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert result.has_errors()
+    assert result.errors == ["agy exited 1: boom"]
+    assert result.metadata["returncode"] == 1
+    assert result.metadata.get("signal_death") is None
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_classifies_sigkill_exit_as_signal_death(
+    mock_run, mock_home, tmp_path
+):
+    """returncode 137 = 128+9 (SIGKILL): must be distinguishable from an
+    ordinary agent-side non-zero exit, not just prose in the error string."""
+    mock_home.return_value = tmp_path
+    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=137, stdout="", stderr="")
+
+    def side_effect(*args, **kwargs):
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path)
+        return mock_run.return_value
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+    )
+    result = agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert result.has_errors()
+    assert result.metadata.get("returncode") == 137
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 9
+    assert signal_death["signal_name"] == "SIGKILL"
+    assert signal_death["returncode"] == 137
+    assert any("signal" in e.lower() for e in result.errors)
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_classifies_sigterm_exit_as_signal_death(
+    mock_run, mock_home, tmp_path
+):
+    """returncode 143 = 128+15 (SIGTERM)."""
+    mock_home.return_value = tmp_path
+    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=143, stdout="", stderr="")
+
+    def side_effect(*args, **kwargs):
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path)
+        return mock_run.return_value
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+    )
+    result = agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert result.has_errors()
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 15
+    assert signal_death["signal_name"] == "SIGTERM"
+    assert signal_death["returncode"] == 143
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_execute_flow_missing_transcript_falls_back_to_stdout(
     mock_run, mock_home, tmp_path
 ):

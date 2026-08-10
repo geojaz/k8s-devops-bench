@@ -29,6 +29,7 @@ from devops_bench.agents import config as agents_config
 from devops_bench.agents import result as agents_result
 from devops_bench.agents.cli.antigravity import parsing
 from devops_bench.agents.shared import cli_capabilities
+from devops_bench.agents.shared.signal_death import classify_returncode
 from devops_bench.core import subprocess as devops_subprocess
 
 if TYPE_CHECKING:
@@ -387,10 +388,19 @@ class AgyCliAgent(base.AgentHarness):
                 output = (timeout_exc.stdout or "").strip() or f"Error: {timeout_exc}"
         elif completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
-            errors.append(f"agy exited {completed.returncode}: {stderr or '<no stderr>'}")
             metadata["returncode"] = completed.returncode
-            if not output:
-                output = f"Error: agy exited {completed.returncode}"
+            signal_death, message = classify_returncode("agy", completed.returncode, stderr)
+            errors.append(message)
+            if signal_death is not None:
+                metadata["signal_death"] = signal_death
+                if not output:
+                    output = (
+                        f"Error: agy killed by signal {signal_death['signal']} "
+                        f"({signal_death['signal_name']})"
+                    )
+            else:
+                if not output:
+                    output = f"Error: agy exited {completed.returncode}"
 
         # Fall back to raw stdout when the transcript yielded no output.
         if not output and completed is not None and completed.stdout:

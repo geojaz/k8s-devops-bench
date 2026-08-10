@@ -36,7 +36,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import signal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -50,6 +49,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.signal_death import classify_returncode
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import CompletedProcess, run
@@ -328,35 +328,16 @@ class GeminiCliAgent(AgentHarness):
         elif completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             metadata["returncode"] = completed.returncode
-            # 128+N is the shell/subprocess convention for "killed by signal
-            # N" (137 = 128+9 = SIGKILL, 143 = 128+15 = SIGTERM), covering
-            # every signal generically rather than special-casing the two
-            # most common ones. A signal death here means something OUTSIDE
-            # the agent's own reasoning ended the process: an OOM kill, an
-            # operator Ctrl-C, or (the case this distinction exists for) the
-            # sandbox reaper killing the container. It must not be
-            # indistinguishable from the agent genuinely failing on its own,
-            # or an infra kill silently corrupts the "did the agent fail"
-            # evidence in results.json.
-            signal_num = completed.returncode - 128 if completed.returncode > 128 else None
-            if signal_num is not None:
-                try:
-                    signal_name = signal.Signals(signal_num).name
-                except ValueError:
-                    signal_name = f"SIG{signal_num}"
-                metadata["signal_death"] = {
-                    "signal": signal_num,
-                    "signal_name": signal_name,
-                    "returncode": completed.returncode,
-                }
-                errors.append(
-                    f"gemini killed by signal {signal_num} ({signal_name}), "
-                    f"exit {completed.returncode}: {stderr or '<no stderr>'}"
-                )
+            signal_death, message = classify_returncode("gemini", completed.returncode, stderr)
+            errors.append(message)
+            if signal_death is not None:
+                metadata["signal_death"] = signal_death
                 if not output:
-                    output = f"Error: gemini killed by signal {signal_num} ({signal_name})"
+                    output = (
+                        f"Error: gemini killed by signal {signal_death['signal']} "
+                        f"({signal_death['signal_name']})"
+                    )
             else:
-                errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
                 if not output:
                     output = f"Error: gemini exited {completed.returncode}"
         return AgentResult(
