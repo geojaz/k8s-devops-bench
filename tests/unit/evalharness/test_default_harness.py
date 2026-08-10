@@ -909,6 +909,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "status",
         "error",
         "errors",
+        "signal_death",
         "scores",
         "expected_output",
         "expected_output_raw",
