@@ -71,12 +71,23 @@ TOKEN_DURATION = os.environ.get("BENCH_AGENT_TOKEN_DURATION", "2h")
 
 # Every sandboxed container this harness starts carries this name prefix,
 # followed by its run workspace's own directory name (see
-# ``container_name_for_workspace``). The prefix is what lets
-# ``sweep_stray_containers`` find and reap containers this harness itself
-# created, and only those: a name match is the entire authorization to kill
-# something, so it must never be able to match a container this harness did
-# not start.
+# ``container_name_for_workspace``). The name prefix alone is NOT sufficient
+# authorization to kill a container: any concurrent invocation of this same
+# harness produces containers matching this same prefix, so a name match only
+# narrows candidates to "something this harness family created", never to
+# "something this harness INSTANCE created". See the owner labels below,
+# which is what actually authorizes a kill.
 _CONTAINER_NAME_PREFIX = "devops-bench-agent-"
+
+# Docker labels recording which process created a sandboxed container, so
+# ``sweep_stray_containers`` can tell "orphaned by a dead process" apart from
+# "belongs to a live sibling invocation" instead of assuming every
+# name-prefix match is fair game. The boot id guards against PID reuse across
+# a host reboot: a PID recorded before a reboot can alias a live, unrelated
+# process afterwards, and without the boot id that alias would read as "owner
+# still alive" and the container would never be reaped.
+_OWNER_PID_LABEL = "devops-bench.owner-pid"
+_OWNER_BOOT_ID_LABEL = "devops-bench.owner-boot-id"
 
 # Docker rejects, rather than clamps, a --user outside int32 range.
 _DOCKER_MAX_ID = 2147483647
@@ -85,6 +96,40 @@ _DOCKER_MAX_ID = 2147483647
 # Mirrors the port-forward teardown grace period in k8s.kubectl
 # (_PORT_FORWARD_TERM_GRACE_SEC).
 _CONTAINER_TERM_GRACE_SEC = 5
+
+
+def _boot_id() -> str:
+    """The kernel's random boot id, distinguishing this boot from any other.
+
+    Falls back to a fixed sentinel if unreadable (non-Linux, restricted
+    ``/proc`), in which case owner-liveness checks degrade to PID-only, same
+    as before this ever existed on a host where it can't be read.
+    """
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return "unknown-boot-id"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a PID, regardless of who owns it.
+
+    ``os.kill(pid, 0)`` sends no signal, only asks the kernel whether the
+    process table entry exists. ``ProcessLookupError`` means it does not
+    (the pid is free to be reaped from); ``PermissionError`` means it exists
+    but is owned by someone else, which still counts as alive. Any other
+    ``OSError`` is treated as "alive" deliberately: this function guards a
+    kill decision, and the failure mode of a wrong "alive" is a leaked
+    container, while the failure mode of a wrong "dead" is killing a live
+    sibling. The two are not symmetric, so ambiguity must resolve to "alive".
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _docker_user_spec() -> tuple[str, bool, int, int]:
@@ -366,6 +411,16 @@ def wrap_argv(
 
     name_flags = ["--name", container_name] if container_name else []
 
+    # Stamp the owning process's identity so a later sweep can prove liveness
+    # instead of assuming a name-prefix match means "safe to kill". See
+    # sweep_stray_containers.
+    owner_flags = [
+        "--label",
+        f"{_OWNER_PID_LABEL}={os.getpid()}",
+        "--label",
+        f"{_OWNER_BOOT_ID_LABEL}={_boot_id()}",
+    ]
+
     user_spec, ran_as_root, uid, gid = _docker_user_spec()
     command = list(argv)
     if ran_as_root:
@@ -387,6 +442,7 @@ def wrap_argv(
         "run",
         "--rm",
         *name_flags,
+        *owner_flags,
         "--network",
         "kind",
         "--user",
@@ -480,27 +536,91 @@ def container_guard(name: str) -> Iterator[None]:
 
 
 def sweep_stray_containers() -> None:
-    """Best-effort reap of containers this harness left running from a prior run.
+    """Best-effort reap of containers orphaned by a prior, now-dead harness process.
 
     Intended to run once at harness start (before any run's own container
     exists) so a container orphaned by a prior crash or a killed harness
-    process gets cleaned up before it burns any more quota. Matches
-    exclusively on :data:`_CONTAINER_NAME_PREFIX`, this harness's own naming
-    convention, so it can never reap a container it did not itself create.
+    process gets cleaned up before it burns any more quota.
+
+    :data:`_CONTAINER_NAME_PREFIX` narrows the candidate list to containers
+    this harness's naming convention could have produced, but it is NOT what
+    authorizes a kill: a concurrent invocation of this same harness produces
+    containers matching that same prefix, so a name match alone cannot tell
+    "orphaned" apart from "belongs to a live sibling run in progress". The
+    owner labels :func:`wrap_argv` stamps at ``docker run`` time (the
+    creating process's PID and boot id) are what does: a candidate is only
+    reaped when its recorded boot id does not match this boot (its owner's
+    whole process tree necessarily no longer exists) or its owner PID is not
+    alive on this boot (:func:`_pid_alive`). A candidate whose owner is
+    proven alive, or whose owner cannot be determined at all (no labels,
+    e.g. a container started before this labeling existed), is left alone:
+    the failure mode of skipping a truly-dead one is a leaked container,
+    logged for manual cleanup; the failure mode of reaping a live one is
+    killing a sibling run's in-progress agent, which is the bug this
+    replaces. Escalates through :func:`kill_container`'s SIGTERM-then-grace
+    path rather than a bare SIGKILL, for the same reason ``kill_container``
+    itself does: SIGKILL skips the root-fallback shell's EXIT trap that
+    chowns ``/workspace`` back to the operator.
     """
     listed = run(
-        ["docker", "ps", "-q", "--filter", f"name=^{_CONTAINER_NAME_PREFIX}"],
+        [
+            "docker",
+            "ps",
+            "--filter",
+            f"name=^{_CONTAINER_NAME_PREFIX}",
+            "--format",
+            f'{{{{.ID}}}}\t{{{{.Label "{_OWNER_PID_LABEL}"}}}}\t{{{{.Label "{_OWNER_BOOT_ID_LABEL}"}}}}',
+        ],
         check=False,
     )
     if listed.returncode != 0:
         return
-    stray_ids = [line.strip() for line in (listed.stdout or "").splitlines() if line.strip()]
-    for container_id in stray_ids:
-        result = run(["docker", "kill", container_id], check=False)
-        if result.returncode == 0:
+
+    current_boot = _boot_id()
+    for line in (listed.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split("\t")
+        container_id = fields[0]
+        owner_pid_str = fields[1] if len(fields) > 1 else ""
+        owner_boot_id = fields[2] if len(fields) > 2 else ""
+
+        if not owner_pid_str or not owner_boot_id:
+            # No owner recorded (predates owner labels, or labels were
+            # stripped): cannot prove the owner is gone, so do not touch it.
             _log.warning(
-                "reaped stray sandbox container %s left running from a prior run", container_id
+                "sandbox container %s has no owner label; skipping reap "
+                "(cannot verify whether its owner is still alive)",
+                container_id,
             )
+            continue
+
+        if owner_boot_id == current_boot:
+            try:
+                owner_pid = int(owner_pid_str)
+            except ValueError:
+                _log.warning(
+                    "sandbox container %s has an unparseable owner pid %r; skipping reap",
+                    container_id,
+                    owner_pid_str,
+                )
+                continue
+            if _pid_alive(owner_pid):
+                # Owner is a live process on this boot: definitely a sibling
+                # run in progress, not orphaned. Never reap it.
+                continue
+
+        # Either a different boot (the owner's entire process tree is gone
+        # with it, PID reuse notwithstanding) or the same boot with a dead
+        # owner pid: provably orphaned, safe to reap.
+        _log.warning(
+            "reaping stray sandbox container %s: owner pid %s (boot %s) is gone",
+            container_id,
+            owner_pid_str,
+            owner_boot_id,
+        )
+        kill_container(container_id)
 
 
 def make_workspace() -> Path:

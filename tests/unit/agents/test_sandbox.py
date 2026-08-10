@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,15 +229,15 @@ def test_container_guard_kills_container_on_timeout_path(monkeypatch: pytest.Mon
     assert killed == ["devops-bench-agent-ws"]
 
 
-def test_sweep_stray_containers_kills_only_matching_names(
+def test_sweep_stray_containers_lists_by_name_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The name-prefix filter still narrows candidates (it's just no longer
+    the sole authorization to kill; see the owner-label tests below)."""
     calls: list[list[str]] = []
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        if argv[:2] == ["docker", "ps"]:
-            return SimpleNamespace(returncode=0, stdout="abc123\ndef456\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
@@ -245,8 +246,110 @@ def test_sweep_stray_containers_kills_only_matching_names(
     list_call = calls[0]
     assert list_call[0:2] == ["docker", "ps"]
     assert any("devops-bench-agent-" in arg for arg in list_call)
+
+
+def _ps_line(container_id: str, pid: str, boot_id: str) -> str:
+    return f"{container_id}\t{pid}\t{boot_id}"
+
+
+def test_sweep_stray_containers_does_not_kill_container_whose_owner_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The core race: a container whose owning process is a live sibling run
+    must never be reaped, even though its name matches the sweep's prefix
+    filter."""
+    own_pid = os.getpid()  # guaranteed alive: it's this test process
+    monkeypatch.setattr(sandbox, "_boot_id", lambda: "boot-a")
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(
+                returncode=0, stdout=_ps_line("live123", str(own_pid), "boot-a") + "\n", stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers()
+
     kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
-    assert kill_calls == [["docker", "kill", "abc123"], ["docker", "kill", "def456"]]
+    assert kill_calls == []
+
+
+def test_sweep_stray_containers_kills_container_whose_owner_pid_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container recorded as owned by a PID that no longer exists, on the
+    current boot, is provably orphaned: reap it."""
+    monkeypatch.setattr(sandbox, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(sandbox, "_pid_alive", lambda pid: False)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(
+                returncode=0, stdout=_ps_line("dead456", "999999", "boot-a") + "\n", stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers()
+
+    kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
+    # kill_container's own SIGTERM-first path: first call is the graceful kill.
+    assert kill_calls[0] == ["docker", "kill", "--signal=TERM", "dead456"]
+
+
+def test_sweep_stray_containers_kills_container_from_a_different_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot id mismatch means the owner's entire process tree ended with
+    that boot, regardless of whether the recorded PID happens to be reused
+    by an unrelated live process on THIS boot. Must reap without even
+    consulting PID liveness."""
+    monkeypatch.setattr(sandbox, "_boot_id", lambda: "boot-current")
+    own_pid = os.getpid()  # alive on this boot, but under a stale boot id
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_ps_line("stale789", str(own_pid), "boot-old") + "\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers()
+
+    kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
+    assert kill_calls[0] == ["docker", "kill", "--signal=TERM", "stale789"]
+
+
+def test_sweep_stray_containers_skips_unlabeled_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No owner labels (predates this change) means liveness cannot be
+    proven either way; the safe default is to leave it alone rather than
+    risk killing something live."""
+    monkeypatch.setattr(sandbox, "_boot_id", lambda: "boot-a")
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(returncode=0, stdout="unlabeled000\t\t\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers()
+
+    kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
+    assert kill_calls == []
 
 
 def test_sweep_stray_containers_handles_docker_ps_failure_without_raising(
@@ -408,3 +511,41 @@ def test_sweep_stray_containers_is_a_noop_when_none_are_running(
 
     kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
     assert kill_calls == []
+
+
+def test_wrap_argv_emits_owner_pid_and_boot_id_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The owner labels sweep_stray_containers relies on must actually be
+    stamped onto every container this harness launches."""
+    monkeypatch.setattr(sandbox.os, "getpid", lambda: 4242)
+    monkeypatch.setattr(sandbox, "_boot_id", lambda: "boot-xyz")
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+        container_name="devops-bench-agent-ws",
+    )
+    label_indices = [i for i, arg in enumerate(argv) if arg == "--label"]
+    label_values = [argv[i + 1] for i in label_indices]
+    assert "devops-bench.owner-pid=4242" in label_values
+    assert "devops-bench.owner-boot-id=boot-xyz" in label_values
+
+
+def test_pid_alive_true_for_current_process() -> None:
+    assert sandbox._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_false_for_a_pid_that_does_not_exist() -> None:
+    # An implausibly large pid does not correspond to any running process.
+    assert sandbox._pid_alive(2**30) is False
+
+
+def test_pid_alive_treats_permission_error_as_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pid owned by another user raises PermissionError on os.kill(pid, 0),
+    but the process very much still exists."""
+
+    def fake_kill(pid, sig):
+        raise PermissionError("not your process")
+
+    monkeypatch.setattr(sandbox.os, "kill", fake_kill)
+    assert sandbox._pid_alive(1) is True
