@@ -409,6 +409,78 @@ def test_execute_falls_back_to_stdout_when_bundle_has_no_answer(
     assert result.output == "bare stdout answer"
 
 
+def test_execute_clean_exit_records_no_signal_death(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_bash(cmd, **kwargs):
+        return _make_subprocess_result(stdout="OK\n", returncode=0)
+
+    _install_oc_run(monkeypatch, fake_bash, _bundle_writer(SAMPLE_EVENTS))
+
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+    assert result.errors == []
+    assert result.metadata.get("signal_death") is None
+
+
+def test_execute_ordinary_non_zero_exit_is_not_a_signal_death(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The 128+N convention must not misfire on an ordinary agent-side failure
+    exit code that happens to be nonzero but well below 128."""
+
+    def fake_bash(cmd, **kwargs):
+        return _make_subprocess_result(stdout="", stderr="boom", returncode=2)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+    assert result.has_errors()
+    assert any("exited 2" in e for e in result.errors)
+    assert result.metadata.get("returncode") == 2
+    assert result.metadata.get("signal_death") is None
+
+
+def test_execute_classifies_sigkill_exit_as_signal_death(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """returncode 137 = 128+9 (SIGKILL): must be distinguishable from an
+    ordinary agent-side non-zero exit, not just prose in the error string."""
+
+    def fake_bash(cmd, **kwargs):
+        return _make_subprocess_result(stdout="", stderr="", returncode=137)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+    assert result.has_errors()
+    assert result.metadata.get("returncode") == 137
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 9
+    assert signal_death["signal_name"] == "SIGKILL"
+    assert signal_death["returncode"] == 137
+    assert any("signal" in e.lower() for e in result.errors)
+
+
+def test_execute_classifies_sigterm_exit_as_signal_death(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """returncode 143 = 128+15 (SIGTERM)."""
+
+    def fake_bash(cmd, **kwargs):
+        return _make_subprocess_result(stdout="", stderr="", returncode=143)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+    assert result.has_errors()
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 15
+    assert signal_death["signal_name"] == "SIGTERM"
+    assert signal_death["returncode"] == 143
+
+
 def test_execute_records_when_sessions_returns_no_rows(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

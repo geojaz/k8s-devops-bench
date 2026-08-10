@@ -74,6 +74,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.signal_death import classify_returncode
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider
@@ -479,8 +480,13 @@ class OpenClawAgent(AgentHarness):
 
             if completed.returncode != 0:
                 stderr = (completed.stderr or "").strip()
-                errors.append(f"oc agent exited {completed.returncode}: {stderr or '<no stderr>'}")
                 metadata["returncode"] = completed.returncode
+                signal_death, message = classify_returncode(
+                    "oc agent", completed.returncode, stderr
+                )
+                errors.append(message)
+                if signal_death is not None:
+                    metadata["signal_death"] = signal_death
 
             trajectory, tokens, bundle_output, export_errors = self._extract_trajectory(
                 oc_bin, env_overlay
