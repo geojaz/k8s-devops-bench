@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from devops_bench.core import get_logger
+from devops_bench.core.errors import redact
 
 __all__ = ["ResultReporter"]
 
@@ -40,6 +41,31 @@ _MANIFEST_FILENAME = "manifest.json"
 
 # Characters not safe in a run-directory name are replaced with a dash.
 _SANITIZE_RUN_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _redact_tree(value: Any) -> Any:
+    """Recursively apply :func:`redact` to every string in a JSON-shaped value.
+
+    This is the last point before disk: whatever secret-shaped text made it
+    into a result record, by a leak path this module's callers already knew
+    about or one nobody has found yet, gets one more chance to be caught here
+    before it becomes a line in a file that gets committed, shared, and
+    pasted into reports. It is deliberately generic (the same NAME-pattern
+    and bare-value matching :func:`redact` already does for command strings)
+    rather than a denylist of field names: an ``error`` string, an ``output``
+    string, a stray ``env`` dump inside a transcript blob, whatever shape a
+    future leak takes, all go through the same regex.
+
+    Does not mutate ``value``; returns a new structure so ``ResultReporter``
+    callers keep whatever object they passed in unchanged.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {key: _redact_tree(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_redact_tree(item) for item in value]
+    return value
 
 
 class ResultReporter:
@@ -110,7 +136,7 @@ class ResultReporter:
         """
         path = Path(run_dir) / _RESULTS_FILENAME
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+            json.dump(_redact_tree(results), f, indent=2)
         _log.info("wrote results.json with %d entries to %s", len(results), path)
         return path
 
@@ -130,7 +156,7 @@ class ResultReporter:
         """
         path = Path(run_dir) / _ROWS_FILENAME
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(rows, f, indent=2)
+            json.dump(_redact_tree(rows), f, indent=2)
         _log.info("wrote rows.json with %d rows to %s", len(rows), path)
         return path
 

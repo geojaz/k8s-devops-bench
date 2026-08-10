@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 
 __all__ = [
@@ -28,7 +29,64 @@ __all__ = [
     "NotRegisteredError",
     "MissingDependencyError",
     "SubprocessError",
+    "redact",
 ]
+
+# Names that mark an env-var assignment's value as secret-shaped, regardless
+# of provider (GEMINI_API_KEY, GOOGLE_API_KEY, ANTHROPIC_API_KEY, ...). Lives
+# here, not only in core.subprocess, because SubprocessError's own message
+# (built below) is a second place a secret-bearing command can be rendered to
+# a string; both need the same redaction, and this module has no dependency
+# on core.subprocess so it can be the shared home without a circular import.
+_SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
+
+# `NAME=value` assignments, whether standalone (`FOO=bar cmd`) or following a
+# docker-style `-e` flag (`-e FOO=bar`): both render as the same substring in
+# a space-joined command string.
+_ENV_ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
+
+# Bare secret shapes to catch even outside an env-var assignment, e.g. a key
+# embedded in a URL or CLI flag value. Google API keys today; extend as other
+# providers' key shapes turn up in a logged command or message.
+_BARE_SECRET_PATTERNS = [re.compile(r"AIza[0-9A-Za-z_-]{35}")]
+
+
+def _mask(value: str) -> str:
+    return f"{value[:4]}****"
+
+
+def redact(text: str) -> str:
+    """Mask secret-shaped values in a rendered command or message string.
+
+    Never apply this to a command actually about to be executed; it exists
+    solely to keep secrets out of anything that gets logged, raised, or
+    persisted as text.
+
+    Masks two things:
+        * The value of any ``NAME=value`` assignment (bare or after ``-e``)
+          whose name matches a secret pattern (KEY, TOKEN, SECRET, PASSWORD,
+          CREDENTIAL, case-insensitive).
+        * Any bare token matching a known secret key shape, whether or not it
+          appears in a ``NAME=value`` assignment.
+
+    Args:
+        text: The string about to be logged, raised, or serialized.
+
+    Returns:
+        The same string with secret-shaped values masked, preserving a
+        4-character prefix (e.g. ``AIza****``).
+    """
+
+    def _replace_env(match: re.Match[str]) -> str:
+        name, value = match.group(1), match.group(2)
+        if _SECRET_NAME_RE.search(name):
+            return f"{name}={_mask(value)}"
+        return match.group(0)
+
+    redacted = _ENV_ASSIGNMENT_RE.sub(_replace_env, text)
+    for pattern in _BARE_SECRET_PATTERNS:
+        redacted = pattern.sub(lambda m: _mask(m.group(0)), redacted)
+    return redacted
 
 
 class DevOpsBenchError(Exception):
@@ -101,7 +159,12 @@ class SubprocessError(DevOpsBenchError):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
-        message = f"command failed with exit code {returncode}: {' '.join(self.cmd)}"
+        # redact() covers the command AND stderr: a failing command's own
+        # stderr can echo back the invocation (or another secret-shaped
+        # value) just as easily as the argv does. self.cmd itself is kept
+        # unredacted for callers that need the real argv programmatically
+        # (e.g. re-running it); only the string form is scrubbed.
+        message = redact(f"command failed with exit code {returncode}: {' '.join(self.cmd)}")
         if stderr:
-            message += f"\nstderr: {stderr.strip()}"
+            message += f"\nstderr: {redact(stderr.strip())}"
         super().__init__(message)

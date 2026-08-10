@@ -332,6 +332,19 @@ def wrap_argv(
             :func:`container_guard` / :func:`sweep_stray_containers`) even
             after the local ``docker run`` client process is gone. Normally
             :func:`container_name_for_workspace` derived from ``workspace``.
+
+    ``extra_env`` values never appear in the returned argv. Each entry becomes
+    a BARE ``-e KEY`` flag (no ``=value``), which tells ``docker run`` to copy
+    the value from the *docker client process's own environment* into the
+    container rather than taking it from the command line. The caller is
+    responsible for making sure that value is actually present in the
+    environment of the process that will exec this argv (see
+    ``core.subprocess.run``'s ``extra_env`` parameter, which sets it there
+    without ever touching argv). This is what keeps a secret out of every
+    sink that renders a command list to a string: shell logging, an
+    exception's ``str()``, a serialized ``results.json`` record. Only the
+    docker CLI's own process environment ever holds the plaintext value, and
+    nothing in this codebase logs a full environment mapping.
     """
     image = image or os.environ.get("BENCH_AGENT_IMAGE", "")
     if not image:
@@ -341,10 +354,15 @@ def wrap_argv(
     # scraping os.environ for well-known credential names: that would reinstate
     # "inherit whatever the operator happened to export", which is the behaviour
     # this wrapper exists to remove. If a credential is not in the resolved
-    # config, the agent does not get it.
+    # config, the agent does not get it. The VALUE, however, is deliberately
+    # never interpolated into a flag here (see the ``extra_env`` note above):
+    # only the NAME crosses into argv, uniformly for every key, not only ones
+    # that look secret-shaped by name. The next credential this harness grows
+    # will not be caught by a denylist of known key names; not building the
+    # leak channel in the first place does not need one.
     env_flags: list[str] = []
-    for key, value in (extra_env or {}).items():
-        env_flags += ["-e", f"{key}={value}"]
+    for key in extra_env or {}:
+        env_flags += ["-e", key]
 
     name_flags = ["--name", container_name] if container_name else []
 
