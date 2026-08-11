@@ -46,3 +46,15 @@ variable "node_count" {
   description = "Number of nodes (1 control-plane + worker nodes)"
   default     = 3
 }
+
+variable "disable_default_cni" {
+  type        = bool
+  description = "Disable the default kindnet CNI so a real CNI can be installed instead. Off by default, which preserves today's kindnet behavior."
+  default     = false
+}
+
+variable "pod_subnet" {
+  type        = string
+  description = "Pod CIDR to pass through to kind's networking config. Empty string means unset, which preserves kind's own default."
+  default     = ""
+}

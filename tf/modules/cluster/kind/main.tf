@@ -41,6 +41,18 @@ resource "kind_cluster" "default" {
         role = "worker"
       }
     }
+
+    # Only emit a networking stanza when a caller opts into a non-default
+    # value. With both inputs at their defaults, no networking block is
+    # rendered at all, which keeps the config identical to before this
+    # stanza existed.
+    dynamic "networking" {
+      for_each = (var.disable_default_cni || var.pod_subnet != "") ? [1] : []
+      content {
+        disable_default_cni = var.disable_default_cni ? true : null
+        pod_subnet          = var.pod_subnet != "" ? var.pod_subnet : null
+      }
+    }
   }
 }
 
