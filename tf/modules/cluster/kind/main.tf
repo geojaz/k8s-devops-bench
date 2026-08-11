@@ -21,11 +21,26 @@ terraform {
   }
 }
 
+locals {
+  # Stock Calico manifests assume 192.168.0.0/16 for their IPAM pool. The
+  # manifest itself leaves CALICO_IPV4POOL_CIDR commented out and instead
+  # auto-detects the pool from each node's spec.podCIDR, so what actually
+  # has to match is the pod subnet kubeadm hands out to nodes. When a caller
+  # disables the default CNI and does not set an explicit pod_subnet, default
+  # to Calico's own assumption rather than leaving the two silently mismatched.
+  effective_pod_subnet = var.pod_subnet != "" ? var.pod_subnet : (var.disable_default_cni ? "192.168.0.0/16" : "")
+}
+
 resource "kind_cluster" "default" {
   name            = var.cluster_name
   node_image      = var.node_image
   kubeconfig_path = pathexpand(var.kubeconfig_path)
-  wait_for_ready  = true
+
+  # The provider's own wait_for_ready polls kind's node-Ready condition
+  # (sigs.k8s.io/kind's waitforready action), which never becomes true
+  # without a CNI. When the default CNI is disabled, skip the provider's
+  # wait and do our own after the CNI is installed, below.
+  wait_for_ready = var.disable_default_cni ? false : true
 
   kind_config {
     kind        = "Cluster"
@@ -50,9 +65,36 @@ resource "kind_cluster" "default" {
       for_each = (var.disable_default_cni || var.pod_subnet != "") ? [1] : []
       content {
         disable_default_cni = var.disable_default_cni ? true : null
-        pod_subnet          = var.pod_subnet != "" ? var.pod_subnet : null
+        pod_subnet          = local.effective_pod_subnet != "" ? local.effective_pod_subnet : null
       }
     }
+  }
+}
+
+# Installs a real CNI so NetworkPolicy is actually enforced, but only when a
+# caller opted into disable_default_cni. This has to live here, not in
+# setup.sh, because the cluster is never considered ready without a CNI:
+# setup.sh only runs after Terraform's own wait, and that wait never
+# resolves for a CNI-less cluster. The module owns the full sequence itself:
+# create the cluster (without waiting), install the CNI, then wait for
+# rollout and node readiness before returning control to the caller.
+resource "null_resource" "install_cni" {
+  count      = var.disable_default_cni ? 1 : 0
+  depends_on = [kind_cluster.default]
+
+  triggers = {
+    cluster = kind_cluster.default.name
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      export KUBECONFIG='${pathexpand(var.kubeconfig_path)}'
+      kubectl apply -f '${var.cni_manifest_url}'
+      kubectl -n kube-system rollout status daemonset/calico-node --timeout='${var.cni_wait_timeout}'
+      kubectl wait --for=condition=Ready nodes --all --timeout='${var.cni_wait_timeout}'
+    EOT
   }
 }
 
