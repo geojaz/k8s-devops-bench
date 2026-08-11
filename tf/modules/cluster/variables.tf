@@ -104,3 +104,15 @@ variable "node_image" {
   default     = "kindest/node:v1.29.2"
 }
 
+variable "disable_default_cni" {
+  type        = bool
+  description = "Disable the default kindnet CNI so a real CNI can be installed instead. Off by default, which preserves today's kindnet behavior. (KinD-only)"
+  default     = false
+}
+
+variable "pod_subnet" {
+  type        = string
+  description = "Pod CIDR to pass through to kind's networking config. Empty string means unset, which preserves kind's own default. (KinD-only)"
+  default     = ""
+}
+
