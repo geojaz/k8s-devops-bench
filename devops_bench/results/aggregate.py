@@ -167,6 +167,8 @@ def build_manifests(rows: Iterable[ResultRow], *, run_id: str, t: str) -> list[M
             model=row.model,
             harness=row.harness,
             augmentation=list(row.augmentation),
+            sandboxed=row.sandboxed,
+            sandbox_image=row.sandbox_image,
         )
     return list(manifests.values())
 

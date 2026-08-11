@@ -24,6 +24,7 @@ import behavior.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import threading
 from pathlib import Path
@@ -56,6 +57,8 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "AGENT_PROVIDER",
         "TARGET_DEPLOYMENT_NAME",
         "NAMESPACE",
+        "BENCH_AGENT_SANDBOX",
+        "BENCH_AGENT_IMAGE",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -1171,3 +1174,77 @@ def test_sweep_stray_sandbox_containers_survives_a_sweep_failure(
 
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
     harness._sweep_stray_sandbox_containers()  # noqa: SLF001 - must not raise
+
+
+# --- sandboxed state reaches manifest.json / rows.json ---
+
+
+def test_write_run_artifacts_records_sandboxed_true_on_the_gemini_path(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from devops_bench.evalharness.reporter import ResultReporter
+
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+
+    harness = DefaultEvalHarness(
+        project_id="p",
+        cluster_name="c",
+        reporter=ResultReporter(tmp_path),
+        agent_type="gemini",
+    )
+    run_dir = harness.reporter.new_run_dir()
+    harness._write_run_artifacts(run_dir, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    rows = json.loads((run_dir / "rows.json").read_text())
+    assert manifest["sandboxed"] is True
+    assert manifest["sandboxImage"] == "devops-bench/agent-sandbox:dev"
+    assert rows[0]["sandboxed"] is True
+    assert rows[0]["sandboxImage"] == "devops-bench/agent-sandbox:dev"
+
+
+def test_write_run_artifacts_records_sandboxed_false_when_sandbox_off(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from devops_bench.evalharness.reporter import ResultReporter
+
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+
+    harness = DefaultEvalHarness(
+        project_id="p",
+        cluster_name="c",
+        reporter=ResultReporter(tmp_path),
+        agent_type="gemini",
+    )
+    run_dir = harness.reporter.new_run_dir()
+    harness._write_run_artifacts(run_dir, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    rows = json.loads((run_dir / "rows.json").read_text())
+    assert manifest["sandboxed"] is False
+    assert manifest["sandboxImage"] is None
+    assert rows[0]["sandboxed"] is False
+
+
+def test_write_run_artifacts_records_sandboxed_false_for_a_non_containerising_adapter(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-gemini adapter never containerises, so it must never read as
+    sandboxed even when BENCH_AGENT_SANDBOX is (irrelevantly) set."""
+    from devops_bench.evalharness.reporter import ResultReporter
+
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+
+    harness = DefaultEvalHarness(
+        project_id="p",
+        cluster_name="c",
+        reporter=ResultReporter(tmp_path),
+        agent_type="openclaw",
+    )
+    run_dir = harness.reporter.new_run_dir()
+    harness._write_run_artifacts(run_dir, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["sandboxed"] is False
+    assert manifest["sandboxImage"] is None
