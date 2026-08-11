@@ -80,6 +80,7 @@ _log = get_logger("evalharness.default")
 # registry, with no edit here.
 _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
     "devops_bench.agents.cli.gemini_cli",
+    "devops_bench.agents.cli.claude_code",
     "devops_bench.agents.cli.openclaw",
     "devops_bench.agents.cli.antigravity",
     "devops_bench.agents.api.agent",
@@ -88,6 +89,7 @@ _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
 # Aliases normalized to canonical agent keys before registry lookup.
 _AGENT_TYPE_ALIASES: dict[str, str] = {
     "gemini-cli": "gemini",
+    "claude-code": "claude",
 }
 
 # Default agent type when neither --agent-type nor BENCH_AGENT_TYPE is set.
@@ -206,6 +208,17 @@ def _pin_verification_targets(
         _pin_verifier_leaves(entry.check, kubeconfig, context)
 
 
+def _canonical_agent_type(agent_type: str) -> str:
+    """Normalize an agent-type alias to its canonical registry key.
+
+    The single source of truth for both registry lookup and result recording,
+    so an arm selected via a friendly alias (``claude-code`` / ``gemini-cli``)
+    aggregates under the same ``harness`` / ``setup_id`` as the canonical key
+    instead of splitting into a second dashboard setup.
+    """
+    return _AGENT_TYPE_ALIASES.get(agent_type, agent_type)
+
+
 class DefaultEvalHarness(Harness):
     """Standard harness wiring every component into one pipeline.
 
@@ -318,7 +331,7 @@ class DefaultEvalHarness(Harness):
                 canonical key.
         """
         _ensure_builtin_agents_registered()
-        key = _AGENT_TYPE_ALIASES.get(agent_type, agent_type)
+        key = _canonical_agent_type(agent_type)
         agent_cls = AGENTS.get(key)
         if agent_cls is None:
             raise NotRegisteredError(AGENTS.name, key, AGENTS.keys())
@@ -877,19 +890,22 @@ class DefaultEvalHarness(Harness):
         augmentation = derive_augmentation(
             {"use_mcp": self.use_mcp, "skills": list(self._granted_skill_paths)}
         )
-        model = self._agent_config.model or self._agent_config.provider or self.agent_type
-        # Canonicalize the same way resolve_agent() does before registry lookup,
-        # so sandbox capability is checked against the agent that actually ran
-        # (e.g. "gemini-cli" resolves to "gemini"), not the raw configured alias.
-        canonical_agent_type = _AGENT_TYPE_ALIASES.get(self.agent_type, self.agent_type)
-        sandboxed = sandbox.sandbox_state(canonical_agent_type)
+        # Canonicalize once: the same key both records the harness in the
+        # manifest (so an arm selected via a friendly alias, e.g.
+        # ``claude-code`` / ``gemini-cli``, aggregates under the canonical
+        # key instead of splitting into a second dashboard setup) and gates
+        # sandbox capability against the agent that actually ran, not the
+        # raw configured alias.
+        harness = _canonical_agent_type(self.agent_type)
+        model = self._agent_config.model or self._agent_config.provider or harness
+        sandboxed = sandbox.sandbox_state(harness)
         manifest = Manifest(
             schema_version=SCHEMA_VERSION,
             run_id=run_dir.name,
             t=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            setup_id=results_setup_id(model, self.agent_type, augmentation),
+            setup_id=results_setup_id(model, harness, augmentation),
             model=model,
-            harness=self.agent_type,
+            harness=harness,
             augmentation=augmentation,
             sandboxed=sandboxed,
             sandbox_image=sandbox.sandbox_image(sandboxed),
