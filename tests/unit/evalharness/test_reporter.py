@@ -14,10 +14,15 @@
 
 """Unit tests for the ``ResultReporter`` sink.
 
-The reporter is a thin sink: it writes the payload it is handed verbatim to
+The reporter is a thin sink: it writes the payload it is handed to
 ``results.json`` / ``rows.json`` / ``manifest.json`` under a per-run directory,
-and mints unique, filesystem-safe run directories. These tests pin that behavior
-directly against ``ResultReporter``, with no dependency on the eval harness.
+and mints unique, filesystem-safe run directories. The one exception to
+"verbatim" is ``write``/``write_rows``, which redact secret-shaped strings
+(anything that looks like ``SOME_KEY=<value>`` or a bare provider key) before
+serializing: this is the last point before disk, and a credential-shaped
+string reaching it, from any leak path, known or not, should not survive to
+``results.json``. These tests pin that behavior directly against
+``ResultReporter``, with no dependency on the eval harness.
 """
 
 from __future__ import annotations
@@ -39,6 +44,43 @@ def test_reporter_writes_results_json_with_indented_payload(tmp_path: Path) -> N
     assert written == run_dir / "results.json"
     on_disk = json.loads(written.read_text(encoding="utf-8"))
     assert on_disk == payload
+
+
+def test_reporter_redacts_secret_shaped_value_in_results_json(tmp_path: Path) -> None:
+    """A credential-shaped string in ANY field must never reach results.json
+    in the clear, regardless of which leak path put it there."""
+    reporter = ResultReporter(results_root=tmp_path)
+    run_dir = reporter.new_run_dir()
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    payload = [
+        {
+            "name": "demo",
+            "status": "error",
+            "error": f"command failed: docker run -e GEMINI_API_KEY={secret} image",
+            "nested": {"errors": [f"GOOGLE_API_KEY={secret}"]},
+        }
+    ]
+
+    written = reporter.write(run_dir, payload)
+
+    on_disk_text = written.read_text(encoding="utf-8")
+    assert secret not in on_disk_text
+    assert "GEMINI_API_KEY=" in on_disk_text  # the name survives, only the value is masked
+    on_disk = json.loads(on_disk_text)
+    assert on_disk[0]["status"] == "error"  # non-secret fields pass through untouched
+    assert on_disk[0]["name"] == "demo"
+
+
+def test_reporter_write_does_not_mutate_caller_payload(tmp_path: Path) -> None:
+    """Redaction must not mutate the list/dicts the caller passed in."""
+    reporter = ResultReporter(results_root=tmp_path)
+    run_dir = reporter.new_run_dir()
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    payload = [{"error": f"TOKEN={secret}"}]
+
+    reporter.write(run_dir, payload)
+
+    assert payload[0]["error"] == f"TOKEN={secret}"
 
 
 def test_reporter_writes_rows_json(tmp_path: Path) -> None:

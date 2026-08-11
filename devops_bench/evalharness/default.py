@@ -1246,6 +1246,10 @@ class DefaultEvalHarness(Harness):
                     task.validated and not agent_errors and bool(dumped.get("trajectory"))
                 ),
                 "errors": agent_errors,
+                # See _empty_record: only set when the agent process's exit
+                # code was a signal death, so an analyst can filter an
+                # infra-caused kill out of genuine agent_error failures.
+                "signal_death": agent_metadata.get("signal_death"),
                 # First-error scalar so a parser reading ``error`` finds the
                 # same key on the success shape (None when nothing went wrong).
                 "error": agent_errors[0] if agent_errors else None,
@@ -1400,6 +1404,16 @@ class DefaultEvalHarness(Harness):
             "status": "",
             "error": None,
             "errors": [],
+            # Populated only when the agent process's own exit code was a
+            # 128+N signal death (e.g. 137 = SIGKILL, 143 = SIGTERM) rather
+            # than an ordinary non-zero exit; None otherwise, including on
+            # the "failed" (harness-side exception) record shape, which
+            # never runs an agent process at all. Lets an analyst separate
+            # "the agent failed on its own" from "something outside the
+            # agent's control killed it" (an OOM, an operator, the sandbox
+            # reaper) within the same agent_error status, without inventing
+            # a new status value that would need auditing through scoring.
+            "signal_death": None,
             # ``scores`` (the per-metric mapping) is populated by ``_score`` for
             # success records; failed records leave it as the empty dict so the
             # key is always present. There is no aggregate scalar score: the

@@ -49,6 +49,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.signal_death import classify_returncode
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import CompletedProcess, run
@@ -248,12 +249,16 @@ class GeminiCliAgent(AgentHarness):
             # skills tree are written into `workdir`, which is then mounted into the
             # container as /workspace. Only the agent process itself moves.
             #
-            # env_overlay is handed to wrap_argv rather than to run(). It is the
+            # env_overlay is handed to wrap_argv AND to run() below. It is the
             # RESOLVED configuration (provider-routed api key, GEMINI_MODEL, the OTLP
-            # disables), so it is exactly what should cross the boundary, and it crosses
-            # by value as explicit -e flags rather than as inherited process env.
+            # disables), so it is exactly what should cross the container boundary. It
+            # crosses by NAME only in argv (wrap_argv emits bare `-e KEY` flags); the
+            # VALUE crosses through the docker client subprocess's own environment
+            # (run()'s extra_env, below), never through a command-line string. Docker
+            # forwards a bare `-e KEY` from its own process env into the container, so
+            # the secret is legitimately present in the container without ever having
+            # been rendered to text anywhere this harness logs, raises, or serializes.
             run_argv = argv
-            sandboxed = False
             container_name: str | None = None
             if sandbox.sandbox_enabled():
                 cluster = sandbox.current_cluster_name()
@@ -273,7 +278,6 @@ class GeminiCliAgent(AgentHarness):
                     extra_env=env_overlay,
                     container_name=container_name,
                 )
-                sandboxed = True
 
             completed: CompletedProcess | None = None
             timeout_exc: SubprocessError | None = None
@@ -290,7 +294,13 @@ class GeminiCliAgent(AgentHarness):
                 try:
                     completed = run(
                         run_argv,
-                        extra_env=None if sandboxed else env_overlay,
+                        # Needed unconditionally now, sandboxed or not: when
+                        # sandboxed, this is what makes env_overlay's values
+                        # reach the docker CLI's own process environment, so
+                        # the bare `-e KEY` flags wrap_argv emitted have
+                        # something to forward into the container. When not
+                        # sandboxed, this is the pre-existing direct-run path.
+                        extra_env=env_overlay,
                         cwd=workdir,
                         check=False,
                         timeout=self.config.timeout_sec,
@@ -317,10 +327,19 @@ class GeminiCliAgent(AgentHarness):
                 output = f"Error: gemini subprocess error: {timeout_exc}"
         elif completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
-            errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
             metadata["returncode"] = completed.returncode
-            if not output:
-                output = f"Error: gemini exited {completed.returncode}"
+            signal_death, message = classify_returncode("gemini", completed.returncode, stderr)
+            errors.append(message)
+            if signal_death is not None:
+                metadata["signal_death"] = signal_death
+                if not output:
+                    output = (
+                        f"Error: gemini killed by signal {signal_death['signal']} "
+                        f"({signal_death['signal_name']})"
+                    )
+            else:
+                if not output:
+                    output = f"Error: gemini exited {completed.returncode}"
         return AgentResult(
             output=output,
             trajectory=trajectory,

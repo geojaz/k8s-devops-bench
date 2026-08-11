@@ -225,6 +225,54 @@ def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.metadata.get("returncode") == 2
 
 
+def test_execute_classifies_sigkill_exit_as_signal_death(monkeypatch: pytest.MonkeyPatch) -> None:
+    """returncode 137 = 128+9 (SIGKILL): must be distinguishable from an
+    ordinary agent-side non-zero exit, not just prose in the error string.
+    This is exactly the shape produced when the sandbox sweep kills a
+    sibling run's container out from under the agent."""
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(stdout="", stderr="", returncode=137)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    assert result.has_errors()
+    assert result.metadata.get("returncode") == 137
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 9
+    assert signal_death["signal_name"] == "SIGKILL"
+    assert any("signal" in e.lower() for e in result.errors)
+
+
+def test_execute_classifies_sigterm_exit_as_signal_death(monkeypatch: pytest.MonkeyPatch) -> None:
+    """returncode 143 = 128+15 (SIGTERM)."""
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(stdout="", stderr="", returncode=143)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    signal_death = result.metadata.get("signal_death")
+    assert signal_death is not None
+    assert signal_death["signal"] == 15
+    assert signal_death["signal_name"] == "SIGTERM"
+
+
+def test_execute_ordinary_non_zero_exit_is_not_a_signal_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 128+N convention must not misfire on an ordinary agent-side
+    failure exit code that happens to be nonzero but well below 128."""
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(stdout="", stderr="boom", returncode=2)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    assert result.metadata.get("signal_death") is None
+
+
 def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         raise SubprocessError(argv, returncode=-1, stdout="", stderr="timeout")
@@ -769,6 +817,69 @@ def _enable_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
         "build_agent_kubeconfig",
         lambda cluster, dest_dir: dest_dir / "kubeconfig",
     )
+
+
+def test_execute_sandboxed_run_never_puts_api_key_in_docker_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end structural check: with sandboxing on, the API key must
+    reach `run()` only via `extra_env` (the child process's own environment),
+    never inside the docker argv string that gets logged/rendered/raised."""
+    _enable_sandbox(monkeypatch)
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["extra_env"] = kwargs.get("extra_env")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    cfg = AgentConfig(target="gemini", api_key=secret)
+    GeminiCliAgent(cfg).run("p")
+
+    assert secret not in " ".join(captured["argv"])
+    # The value must still reach the docker CLI process somehow, or the
+    # container never gets the credential: it does, via extra_env.
+    assert captured["extra_env"] is not None
+    assert captured["extra_env"]["GEMINI_API_KEY"] == secret
+    assert captured["extra_env"]["GOOGLE_API_KEY"] == secret
+    # And the argv only carries the bare flag name, not `KEY=value`.
+    assert "-e" in captured["argv"]
+    assert "GEMINI_API_KEY" in captured["argv"]
+
+
+def test_execute_sandboxed_timeout_never_leaks_api_key_into_agent_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the reported real-run leak: a sandboxed run times out, the
+    harness catches the resulting `SubprocessError` and folds it into
+    `AgentResult.errors`/`output` (this is exactly what later gets written
+    into results.json's `error` field by the eval harness). Before the fix,
+    `run_argv` built by `wrap_argv` carried `-e GEMINI_API_KEY=<secret>` in
+    plaintext, and `SubprocessError.__str__` rendered it unredacted straight
+    into `errors`. Both are fixed: `run_argv` never carries the value (bare
+    `-e KEY` only), and `SubprocessError`'s message is redacted regardless."""
+    _enable_sandbox(monkeypatch)
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+
+    def fake_run(argv, **kwargs):
+        # Mirrors core.subprocess.run's real behavior on a timeout: it raises
+        # SubprocessError built from the actual argv it was asked to run.
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="")
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    cfg = AgentConfig(target="gemini", api_key=secret)
+    result = GeminiCliAgent(cfg).run("p")
+
+    assert result.metadata.get("timed_out") is True
+    joined_errors = " ".join(result.errors)
+    assert secret not in joined_errors
+    assert secret not in (result.output or "")
+    # AgentResult.to_dict() is what actually feeds results.json; check that
+    # serialization boundary too, not just the dataclass fields.
+    as_dict_text = json.dumps(result.to_dict())
+    assert secret not in as_dict_text
 
 
 def test_execute_sandboxed_run_names_the_container_from_its_workspace(
