@@ -46,3 +46,27 @@ variable "node_count" {
   description = "Number of nodes (1 control-plane + worker nodes)"
   default     = 3
 }
+
+variable "disable_default_cni" {
+  type        = bool
+  description = "Disable the default kindnet CNI so a real CNI can be installed instead. Off by default, which preserves today's kindnet behavior."
+  default     = false
+}
+
+variable "pod_subnet" {
+  type        = string
+  description = "Pod CIDR to pass through to kind's networking config. Empty string means unset, which preserves kind's own default."
+  default     = ""
+}
+
+variable "cni_manifest_url" {
+  type        = string
+  description = "Single-manifest CNI install URL, applied only when disable_default_cni is true."
+  default     = "https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml"
+}
+
+variable "cni_wait_timeout" {
+  type        = string
+  description = "Timeout for the CNI rollout and node-Ready waits, applied only when disable_default_cni is true."
+  default     = "180s"
+}
