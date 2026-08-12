@@ -73,7 +73,15 @@ _ANTHROPIC_KEY_RE = re.compile(r"sk-ant-[0-9A-Za-z_-]{20,}")
 _OPENAI_KEY_RE = re.compile(r"sk-proj-[0-9A-Za-z_-]{20,}|sk-(?!ant-)[0-9A-Za-z]{20,}")
 
 # Bare `NAME=value` shape, standalone or after a flag like `-e`.
-_ENV_ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\S+)")
+#
+# Captured process output (e.g. an `env` dump) is often stored as a single
+# JSON string with literal `\n` escapes rather than real newlines, so an
+# entire environment dump can appear as one physical line. A plain `\S+`
+# value would greedily swallow a literal backslash-n (two non-whitespace
+# characters) and everything after it, hiding every later `KEY=` on the
+# same line. Stop the value at a literal backslash-n as well as at real
+# whitespace.
+_ENV_ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*((?:(?!\\n)\S)+)")
 
 # JSON or Python-dict-repr `"NAME": "value"` / `'NAME': 'value'` shape.
 _STRUCTURED_SECRET_RE = re.compile(

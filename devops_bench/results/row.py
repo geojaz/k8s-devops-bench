@@ -63,6 +63,19 @@ class Manifest(BaseModel):
             ``api``).
         augmentation: Capability tokens active for the run (e.g.
             ``["mcp", "skills"]``); an empty list denotes the baseline arm.
+        sandboxed: Whether the agent actually executed inside the container
+            sandbox (see ``devops_bench.agents.sandbox``). Tri-state, not a
+            bare bool: ``True``/``False`` are always explicitly recorded for
+            a run written by current code, and ``False`` covers both "the
+            operator left the sandbox off" and "this adapter cannot
+            containerise" — both mean the run genuinely executed unsandboxed.
+            ``None`` is reserved for runs written before this field existed;
+            their manifest/rows on disk simply omit the key, and this model's
+            default recovers as "unknown" rather than a fabricated ``False``,
+            so historical runs are never silently misread as unsandboxed.
+        sandbox_image: The ``BENCH_AGENT_IMAGE`` tag the sandbox container
+            actually ran, or ``None`` when ``sandboxed`` is not ``True`` or
+            the run predates this field.
     """
 
     model_config = _MODEL_CONFIG
@@ -74,6 +87,8 @@ class Manifest(BaseModel):
     model: str
     harness: str
     augmentation: list[str]
+    sandboxed: bool | None = None
+    sandbox_image: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``manifest.json``."""
@@ -136,6 +151,11 @@ class ResultRow(BaseModel):
         status: Terminal record status, ``"success"`` or ``"failed"``.
         validated: Whether the task is vetted as correct and eligible for the
             leaderboard; ingest gates promotion on this (default ``False``).
+        sandboxed: Whether the agent actually executed inside the container
+            sandbox; matches :attr:`Manifest.sandboxed`. See that field's
+            docstring for the tri-state semantics.
+        sandbox_image: The sandbox image tag actually used; matches
+            :attr:`Manifest.sandbox_image`.
     """
 
     model_config = _MODEL_CONFIG
@@ -164,6 +184,8 @@ class ResultRow(BaseModel):
     total_tokens: int | None = None
     status: str
     validated: bool = False
+    sandboxed: bool | None = None
+    sandbox_image: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``rows.json``.

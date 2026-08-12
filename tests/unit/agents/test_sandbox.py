@@ -26,6 +26,47 @@ from devops_bench.agents import sandbox
 from devops_bench.core.errors import SubprocessError
 
 
+def test_sandbox_state_true_only_for_capable_adapter_with_env_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    assert sandbox.sandbox_state("gemini") is True
+
+
+def test_sandbox_state_false_for_capable_adapter_with_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    assert sandbox.sandbox_state("gemini") is False
+
+
+def test_sandbox_state_false_for_incapable_adapter_even_with_env_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never report True for an adapter that cannot containerise, regardless
+    of what BENCH_AGENT_SANDBOX says: antigravity/openclaw/api never read it."""
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    for agent_type in ("antigravity", "openclaw", "api"):
+        assert sandbox.sandbox_state(agent_type) is False
+
+
+def test_sandbox_image_none_when_not_sandboxed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    assert sandbox.sandbox_image(False) is None
+
+
+def test_sandbox_image_returns_configured_tag_when_sandboxed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    assert sandbox.sandbox_image(True) == "devops-bench/agent-sandbox:dev"
+
+
+def test_sandbox_image_none_when_sandboxed_but_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BENCH_AGENT_IMAGE", raising=False)
+    assert sandbox.sandbox_image(True) is None
+
+
 def test_container_name_for_workspace_is_deterministic_and_prefixed() -> None:
     name = sandbox.container_name_for_workspace(Path("/tmp/workspace-abc123"))
     assert name == "devops-bench-agent-workspace-abc123"

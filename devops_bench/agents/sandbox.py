@@ -52,6 +52,9 @@ from devops_bench.core.subprocess import run
 
 __all__ = [
     "sandbox_enabled",
+    "SANDBOX_CAPABLE_AGENT_TYPES",
+    "sandbox_state",
+    "sandbox_image",
     "build_agent_kubeconfig",
     "wrap_argv",
     "container_name_for_workspace",
@@ -174,6 +177,52 @@ def sandbox_enabled() -> bool:
     while tasks are still being debugged.
     """
     return os.environ.get("BENCH_AGENT_SANDBOX", "").strip().lower() in {"docker", "1", "true"}
+
+
+# Canonical agent-registry keys whose harness actually knows how to wrap its
+# CLI in a container (see agents/cli/gemini_cli/agent.py, the only caller of
+# wrap_argv). ``antigravity``, ``openclaw`` and ``api`` invoke their agent
+# directly and never read BENCH_AGENT_SANDBOX at all, so for those adapters
+# "sandbox off" is not something the operator chose; the run was never a
+# candidate for containment in the first place.
+SANDBOX_CAPABLE_AGENT_TYPES = frozenset({"gemini"})
+
+
+def sandbox_state(agent_type: str) -> bool:
+    """Whether a run under ``agent_type`` actually executed inside the sandbox.
+
+    Returns True only when ``agent_type`` is one of
+    :data:`SANDBOX_CAPABLE_AGENT_TYPES` AND :func:`sandbox_enabled` is set,
+    the same two conditions the gemini CLI harness itself checks before
+    wrapping its argv in ``docker run``. Every other combination is False:
+    an unset/falsy env var on the gemini path is "off by choice", and any
+    non-gemini adapter is "not applicable" because it cannot containerise
+    regardless of the env var. Both collapse to False here rather than to
+    some third value, because this function records only the run's actual,
+    observable state ("did this process execute inside a container"), which
+    is identical for both cases. The reason a run was not sandboxed is not
+    recoverable from the run itself and is not what this field is for.
+
+    Callers pass the canonical (alias-resolved) agent key, matching what
+    :data:`SANDBOX_CAPABLE_AGENT_TYPES` is keyed on.
+    """
+    return agent_type in SANDBOX_CAPABLE_AGENT_TYPES and sandbox_enabled()
+
+
+def sandbox_image(sandboxed: bool) -> str | None:
+    """The ``BENCH_AGENT_IMAGE`` tag actually used, or None when not sandboxed.
+
+    Only meaningful when ``sandboxed`` is True: an unsandboxed run never
+    passes an image to ``docker run``, so recording a configured-but-unused
+    image tag would misrepresent what happened. ``BENCH_AGENT_IMAGE`` is
+    expected to hold a plain image reference (e.g.
+    ``devops-bench/agent-sandbox:dev``), never a credential, so it is safe to
+    write into a published artifact; see :func:`wrap_argv`, the only place
+    this value is consumed.
+    """
+    if not sandboxed:
+        return None
+    return os.environ.get("BENCH_AGENT_IMAGE") or None
 
 
 def current_cluster_name() -> str | None:

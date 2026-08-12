@@ -865,6 +865,7 @@ class DefaultEvalHarness(Harness):
             run_dir: The run directory the artifacts are written under.
             detailed_results: The scored per-task records.
         """
+        from devops_bench.agents import sandbox
         from devops_bench.results import (
             SCHEMA_VERSION,
             Manifest,
@@ -877,6 +878,11 @@ class DefaultEvalHarness(Harness):
             {"use_mcp": self.use_mcp, "skills": list(self._granted_skill_paths)}
         )
         model = self._agent_config.model or self._agent_config.provider or self.agent_type
+        # Canonicalize the same way resolve_agent() does before registry lookup,
+        # so sandbox capability is checked against the agent that actually ran
+        # (e.g. "gemini-cli" resolves to "gemini"), not the raw configured alias.
+        canonical_agent_type = _AGENT_TYPE_ALIASES.get(self.agent_type, self.agent_type)
+        sandboxed = sandbox.sandbox_state(canonical_agent_type)
         manifest = Manifest(
             schema_version=SCHEMA_VERSION,
             run_id=run_dir.name,
@@ -885,6 +891,8 @@ class DefaultEvalHarness(Harness):
             model=model,
             harness=self.agent_type,
             augmentation=augmentation,
+            sandboxed=sandboxed,
+            sandbox_image=sandbox.sandbox_image(sandboxed),
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])

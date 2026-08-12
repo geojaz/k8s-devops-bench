@@ -202,6 +202,8 @@ def test_build_rows_success_record():
         "totalTokens": None,
         "status": "success",
         "validated": False,
+        "sandboxed": None,
+        "sandboxImage": None,
     }
 
 
@@ -339,6 +341,8 @@ def test_result_row_keys_match_typescript_interface():
         "cacheWriteTokens",
         "totalTokens",
         "validated",
+        "sandboxed",
+        "sandboxImage",
     }
     row = build_rows(
         [{"name": "n", "folder": "f", "status": "success", "scores": {}, "tokens": {}}],
@@ -356,6 +360,8 @@ def test_manifest_to_dict_keys():
         "model",
         "harness",
         "augmentation",
+        "sandboxed",
+        "sandboxImage",
     }
 
 
@@ -368,6 +374,20 @@ def test_build_rows_propagates_validated():
     # Absent key defaults to False (unvetted tasks don't promote).
     default_row = build_rows([{"name": "t", "folder": "f", "status": "success"}], manifest)[0]
     assert default_row.to_dict()["validated"] is False
+
+
+def test_build_rows_propagates_sandboxed_from_manifest():
+    manifest = _manifest(sandboxed=True, sandbox_image="devops-bench/agent-sandbox:dev")
+    row = build_rows([{"name": "t", "folder": "f", "status": "success"}], manifest)[0]
+    assert row.sandboxed is True
+    assert row.sandbox_image == "devops-bench/agent-sandbox:dev"
+
+
+def test_build_rows_sandboxed_defaults_to_unknown_when_manifest_does_not_record_it():
+    manifest = _manifest()
+    row = build_rows([{"name": "t", "folder": "f", "status": "success"}], manifest)[0]
+    assert row.sandboxed is None
+    assert row.sandbox_image is None
 
 
 def test_build_rows_carries_cached_and_reasoning() -> None:
