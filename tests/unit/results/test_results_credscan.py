@@ -169,3 +169,50 @@ def test_scan_tree_unclassifiable_outranks_matched(tmp_path):
     assert result.status is ScanStatus.UNCLASSIFIABLE
     assert result.findings
     assert result.unclassifiable
+
+
+def test_env_dump_secret_after_earlier_assignment_on_same_line_is_a_finding(tmp_path):
+    # Regression: a run artifact stores captured `env` output as one JSON
+    # string value, with newlines encoded as the literal two-character
+    # escape sequence backslash + n, not as real newline bytes. A greedy
+    # `\S+` value capture on the first assignment used to swallow the
+    # literal backslash-n and everything after it, so a secret-keyword
+    # assignment later on the same physical line was never examined.
+    path = _write(
+        tmp_path,
+        "env.txt",
+        f"HOSTNAME=553ee394c4ab\\nGEMINI_API_KEY={FAKE_GOOGLE_KEY}\\nYARN_VERSION=1.22.22\\n\n",
+    )
+    findings = scan_file(path)
+    assert "env-assignment" in [f.rule for f in findings]
+    assert "google-api-key" in [f.rule for f in findings]
+
+
+def test_env_dump_empty_secret_value_is_not_a_finding(tmp_path):
+    path = _write(
+        tmp_path,
+        "env.txt",
+        "HOSTNAME=553ee394c4ab\\nGEMINI_API_KEY=\\nYARN_VERSION=1.22.22\\n\n",
+    )
+    findings = scan_file(path)
+    assert findings == []
+
+
+def test_env_dump_redacted_secret_value_is_not_a_finding(tmp_path):
+    path = _write(
+        tmp_path,
+        "env.txt",
+        "HOSTNAME=553ee394c4ab\\nGEMINI_API_KEY=<redacted>\\nOTHER=x\\n\n",
+    )
+    findings = scan_file(path)
+    assert findings == []
+
+
+def test_env_dump_all_asterisk_secret_value_is_not_a_finding(tmp_path):
+    path = _write(
+        tmp_path,
+        "env.txt",
+        "HOSTNAME=553ee394c4ab\\nGEMINI_API_KEY=********\\nOTHER=x\\n\n",
+    )
+    findings = scan_file(path)
+    assert findings == []
