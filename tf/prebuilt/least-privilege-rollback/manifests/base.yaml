@@ -1,0 +1,169 @@
+# least-privilege-rollback seed. inventory-sync's ClusterRoleBinding to cluster-admin
+# is THE DEFECT: the controller only ever needs a narrow, namespace-scoped permission
+# set (see the reconcile script in the ConfigMap below), and that set is not readable
+# from the RBAC objects on this page -- the agent has to derive it from what the
+# controller does, not from what it is permitted to do.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: warehouse
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inventory-sync
+  namespace: warehouse
+---
+# THE DEFECT. Wildly over-granted: nothing this controller does is cluster-scoped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: inventory-sync-admin
+subjects:
+  - kind: ServiceAccount
+    name: inventory-sync
+    namespace: warehouse
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+# A stand-in for a real credential the controller reads on its slow (hourly) cycle.
+# Content is a dummy value; the point of this Secret is that it exists and is named,
+# not what it holds.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: inventory-sync-creds
+  namespace: warehouse
+type: Opaque
+stringData:
+  token: "dummy-credential-not-a-real-secret"
+---
+# The controller's actual behaviour. This is the "read the source" discovery route the
+# task expects: an agent with cluster-admin-equivalent access to the cluster (which the
+# benchmark harness has, independent of inventory-sync's own grant) can read this
+# ConfigMap and see exactly what the loop calls, at what cadence. What it cannot get
+# from RBAC alone is which of these calls matter, because right now everything is
+# permitted regardless.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inventory-sync-reconcile
+  namespace: warehouse
+data:
+  reconcile.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    NS=warehouse
+    CYCLE=0
+
+    echo "inventory-sync controller starting, reconciling namespace ${NS} every 10s"
+
+    while true; do
+      CYCLE=$((CYCLE + 1))
+
+      # Fast path: exercised every cycle (~10s). This is the surface an agent watching
+      # the controller's first couple of minutes will see in full.
+      kubectl get pods -n "${NS}" -o name >/dev/null
+      kubectl get configmaps -n "${NS}" -o name >/dev/null
+      kubectl get deployments -n "${NS}" -o name >/dev/null
+      kubectl get pods -n "${NS}" --watch --request-timeout=3s >/dev/null 2>&1 || true
+      kubectl get configmaps -n "${NS}" --watch --request-timeout=3s >/dev/null 2>&1 || true
+      kubectl get deployments -n "${NS}" --watch --request-timeout=3s >/dev/null 2>&1 || true
+
+      kubectl patch deployment inventory-sync -n "${NS}" --type=merge \
+        -p "{\"metadata\":{\"annotations\":{\"acme.io/last-reconcile\":\"$(date -u +%FT%TZ)\"}}}" >/dev/null
+
+      kubectl create event inventory-sync-heartbeat \
+        --namespace="${NS}" \
+        --type=Normal \
+        --reason=ReconcileCycle \
+        --message="inventory-sync completed reconcile cycle ${CYCLE}" >/dev/null 2>&1 || true
+
+      # Slow path: exercised roughly hourly (every 360th cycle at a 10s interval), not
+      # on every reconcile. THE TRAP: a grant derived from watching only the first few
+      # minutes of this controller's behaviour never observes this call, and never
+      # grants `get` on this one named Secret.
+      if (( CYCLE % 360 == 0 )); then
+        kubectl get secret inventory-sync-creds -n "${NS}" -o name >/dev/null
+        echo "cycle ${CYCLE}: refreshed credentials from inventory-sync-creds"
+      fi
+
+      sleep 10
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-sync
+  namespace: warehouse
+  labels:
+    app: inventory-sync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-sync
+  template:
+    metadata:
+      labels:
+        app: inventory-sync
+    spec:
+      serviceAccountName: inventory-sync
+      containers:
+        - name: inventory-sync
+          # bitnami/kubectl no longer publishes version-pinned tags for free; :latest
+          # is the tag actually available. See opa-remediation's setup.sh for the same
+          # observation about Kyverno's own bitnami/kubectl-pinned CronJobs.
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "/scripts/reconcile.sh"]
+          volumeMounts:
+            - name: reconcile-script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: reconcile-script
+          configMap:
+            name: inventory-sync-reconcile
+            defaultMode: 0755
+---
+# DISTRACTOR. Also cluster-scoped, also broad by appearance, and genuinely required: a
+# CRD controller that reconciles cluster-wide. Reviewed under a separate finding and out
+# of scope for this task.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: warehouse-operator
+  namespace: warehouse
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: warehouse-operator-role
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: warehouse-operator-crb
+  annotations:
+    acme.io/scope-reviewed: "SEC-1180"
+subjects:
+  - kind: ServiceAccount
+    name: warehouse-operator
+    namespace: warehouse
+roleRef:
+  kind: ClusterRole
+  name: warehouse-operator-role
+  apiGroup: rbac.authorization.k8s.io

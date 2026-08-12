@@ -1,0 +1,272 @@
+# budget-cut seed. Four workloads in one namespace, sized deliberately over budget.
+# The requests below are the point of the task -- do not "fix" them here.
+#
+#   ingest      3 x 512Mi = 1536Mi   grossly over-provisioned
+#   transform   2 x 768Mi = 1536Mi   grossly over-provisioned
+#   aggregator  2 x 640Mi = 1280Mi   correctly sized (the discriminating workload)
+#   cache       1 x 768Mi =  768Mi   floored by annotation, also looks over-provisioned
+#   total: 5120Mi
+#
+# Each workload's container runs a small busybox script (ConfigMap-mounted, see
+# below) that writes a fixed-size file into a Memory-medium emptyDir at /dev/shm
+# and then holds it forever, standing in for the per-pod peak the task's prompt
+# narrates (ingest ~180Mi, transform ~240Mi, aggregator ~610Mi, cache ~200Mi).
+# tmpfs pages are resident RAM, not reclaimable page cache, so the allocation
+# stays held rather than being touched once and freed -- `kubectl top pod`
+# against this seed reports real, non-zero, roughly-stable numbers instead of
+# nginx's idle few-Mi footprint.
+#
+# LIMITATION: for these held allocations to actually land in RAM instead of
+# getting some pods OOMKilled or evicted, the node needs enough free memory for
+# all 8 pods' allocations resident at once: 3x180Mi (ingest) + 2x240Mi
+# (transform) + 2x610Mi (aggregator) + 1x200Mi (cache) = 2440Mi (~2.4Gi), on top
+# of whatever the node OS and other cluster components already use. A kind node
+# with less headroom than that will not hold these figures steady, which would
+# fail the seed's own self-check before an agent gets involved.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: analytics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingest-load
+  namespace: analytics
+data:
+  run.sh: |
+    #!/bin/sh
+    # Holds a real ~180Mi allocation for the ingest workload, standing in for the
+    # per-pod peak the budget-cut task narrates. See the top-of-file comment for
+    # why /dev/shm (tmpfs) rather than a one-shot malloc.
+    set -eu
+    dd if=/dev/zero of=/dev/shm/hold bs=1M count=180 status=none
+    exec tail -f /dev/null
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest
+  namespace: analytics
+  labels:
+    app: ingest
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ingest
+  template:
+    metadata:
+      labels:
+        app: ingest
+    spec:
+      containers:
+        - name: ingest
+          image: busybox:1.36
+          command: ["sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: shm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: 50m
+              memory: 512Mi
+            limits:
+              cpu: 200m
+              memory: 512Mi
+      volumes:
+        - name: script
+          configMap:
+            name: ingest-load
+            defaultMode: 0555
+        - name: shm
+          emptyDir:
+            medium: Memory
+            # Capped at the container's own memory limit so the tmpfs can never
+            # let this pod hold more RAM than its cgroup already allows.
+            sizeLimit: 512Mi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transform-load
+  namespace: analytics
+data:
+  run.sh: |
+    #!/bin/sh
+    # Holds a real ~240Mi allocation for the transform workload, standing in for
+    # the per-pod peak the budget-cut task narrates. See the top-of-file comment
+    # for why /dev/shm (tmpfs) rather than a one-shot malloc.
+    set -eu
+    dd if=/dev/zero of=/dev/shm/hold bs=1M count=240 status=none
+    exec tail -f /dev/null
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transform
+  namespace: analytics
+  labels:
+    app: transform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: transform
+  template:
+    metadata:
+      labels:
+        app: transform
+    spec:
+      containers:
+        - name: transform
+          image: busybox:1.36
+          command: ["sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: shm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: 50m
+              memory: 768Mi
+            limits:
+              cpu: 200m
+              memory: 768Mi
+      volumes:
+        - name: script
+          configMap:
+            name: transform-load
+            defaultMode: 0555
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 768Mi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aggregator-load
+  namespace: analytics
+data:
+  run.sh: |
+    #!/bin/sh
+    # Holds a real ~610Mi allocation for the aggregator workload -- deliberately
+    # close to its 640Mi request. This is the discriminating workload the task
+    # says must NOT be cut: unlike ingest/transform/cache, there is little
+    # headroom between what it actually holds and what it requests. See the
+    # top-of-file comment for why /dev/shm (tmpfs) rather than a one-shot malloc.
+    set -eu
+    dd if=/dev/zero of=/dev/shm/hold bs=1M count=610 status=none
+    exec tail -f /dev/null
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregator
+  namespace: analytics
+  labels:
+    app: aggregator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aggregator
+  template:
+    metadata:
+      labels:
+        app: aggregator
+    spec:
+      containers:
+        - name: aggregator
+          image: busybox:1.36
+          command: ["sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: shm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: 50m
+              memory: 640Mi
+            limits:
+              cpu: 200m
+              memory: 640Mi
+      volumes:
+        - name: script
+          configMap:
+            name: aggregator-load
+            defaultMode: 0555
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 640Mi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cache-load
+  namespace: analytics
+data:
+  run.sh: |
+    #!/bin/sh
+    # Holds a real ~200Mi allocation for the cache workload, standing in for the
+    # peak the budget-cut task narrates. See the top-of-file comment for why
+    # /dev/shm (tmpfs) rather than a one-shot malloc.
+    set -eu
+    dd if=/dev/zero of=/dev/shm/hold bs=1M count=200 status=none
+    exec tail -f /dev/null
+---
+# StatefulSet, not a Deployment: the memory-floor annotation on cache is about a working
+# set that has to survive restarts of a single, identity-bearing pod, which is what a
+# StatefulSet models and a Deployment does not.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cache
+  namespace: analytics
+  labels:
+    app: cache
+  annotations:
+    acme.io/memory-floor: "768Mi"
+    acme.io/floor-rationale: "page cache sizing, DATA-2291"
+spec:
+  serviceName: cache
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cache
+  template:
+    metadata:
+      labels:
+        app: cache
+    spec:
+      containers:
+        - name: cache
+          image: busybox:1.36
+          command: ["sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: shm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: 50m
+              memory: 768Mi
+            limits:
+              cpu: 200m
+              memory: 768Mi
+      volumes:
+        - name: script
+          configMap:
+            name: cache-load
+            defaultMode: 0555
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 768Mi

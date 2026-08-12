@@ -1,0 +1,131 @@
+# two-phase-drain seed. Nothing here is meant to be broken -- this task's
+# entire point is that hand-off is fully healthy. license-daemon's
+# nodeSelector is patched in by setup.sh after apply (it needs the run-unique
+# cluster name, which cannot be baked into a static manifest), everything else
+# is declared here as-is.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: core
+---
+# Spread across both workers so draining either one only ever affects part of
+# the quorum. The PDB is what makes each individual drain safe; it does NOT
+# make two back-to-back drains safe, which is the entire task.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: quorum-store
+  namespace: core
+spec:
+  serviceName: quorum-store
+  replicas: 3
+  selector:
+    matchLabels:
+      app: quorum-store
+  template:
+    metadata:
+      labels:
+        app: quorum-store
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: quorum-store
+      containers:
+        - name: quorum-store
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: quorum-store-pdb
+  namespace: core
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: quorum-store
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: core
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway-pdb
+  namespace: core
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: gateway
+---
+# nodeSelector is patched in by setup.sh once the cluster name is known.
+# Genuinely cannot run anywhere else, per the pin-rationale annotation: this is
+# not a workaround the agent should engineer around, it is a constraint to
+# plan the drain schedule against.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: license-daemon
+  namespace: core
+  annotations:
+    acme.io/pin-rationale: "bound to host licence dongle on worker1"
+spec:
+  # Seeded at ZERO on purpose. The nodeSelector cannot be baked in here (it needs the
+  # run-unique cluster name), so setup.sh patches it in and only then scales to 1.
+  #
+  # Starting at 1 creates an UNPINNED pod that schedules anywhere -- observed landing on
+  # worker2. The subsequent patch rolls a correctly-pinned replacement onto worker1, but
+  # the original lingers in Terminating, and `rollout status` returns as soon as the new
+  # ReplicaSet is complete. Any check that samples "a pod" can then read the corpse and
+  # report the wrong node. Starting at 0 means no pod ever exists without its selector.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: license-daemon
+  template:
+    metadata:
+      labels:
+        app: license-daemon
+    spec:
+      containers:
+        - name: license-daemon
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi

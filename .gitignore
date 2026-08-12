@@ -34,3 +34,15 @@ Thumbs.db
 *.tfstate.backup
 crash.log
 crash.*.log
+
+# Factory-staged tasks and stacks. Staged here to test bench changes
+# against real tasks; not source. Remove the ignore deliberately when
+# a task is ready to go upstream.
+/tasks/b-*/
+/tf/b-*/
+/tf/prebuilt/b-*/
+
+# Harness run output
+/results/
+/runs/
+/scratchpad/

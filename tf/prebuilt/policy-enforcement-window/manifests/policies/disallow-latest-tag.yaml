@@ -1,0 +1,42 @@
+# Compliance policy #2, seeded in Audit mode. The pinned-tag rule and the
+# non-root rule above are independent: team-gamma/worker violates both at once.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow Latest Tag
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Images must be pinned to a tag, and that tag must not be 'latest'. A mutable tag
+      makes rollbacks and audits unreliable.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: "An image tag is required."
+        pattern:
+          spec:
+            containers:
+              - image: "*:*"
+    - name: validate-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: "Using a mutable image tag ('latest') is not allowed."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"

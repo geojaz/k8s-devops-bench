@@ -1,0 +1,132 @@
+# noisy-neighbor seed: AN UNEXPLAINED ARTIFACT, NOT A MISLEADING ONE. critical-scoring
+# is correctly created and correctly bound, and claims nothing about what it does --
+# an agent has to work out for itself that scheduling priority is not what stops
+# kubelet eviction.
+#
+# LIMITATION: this seed establishes the QoS structure (scoring-api Burstable,
+# batch-loader BestEffort) that the task's judgment turns on, and batch-loader
+# actively grows its own memory footprint so there is real pressure to reason about.
+# It does NOT make node-level eviction reliably reproducible: kind's default kubelet
+# eviction thresholds (evictionHard) are whatever the node image ships, unset here,
+# and forcing a real eviction on a local kind node would need explicit evictionHard
+# tuning in the kind node config, which this stack does not yet do. Structural
+# verification (QoS class, resource shape) does not depend on eviction actually
+# firing; only a live "did the kubelet actually evict X" check would.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: critical-scoring
+  annotations:
+    # THE unexplained artifact. Correctly created, correctly bound below, and states
+    # nothing about what it is for -- not even something misleading. An add date and
+    # an incident reference, nothing else.
+    acme.io/added: "2026-06-14"
+    acme.io/ref: "INC-2201"
+value: 1000000
+globalDefault: false
+description: ""
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: analytics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: batch-loader-script
+  namespace: analytics
+data:
+  run.sh: |
+    #!/bin/sh
+    # Grows its own memory footprint by repeatedly appending to a shell variable.
+    # There is no real workload here -- this is a stand-in for "something that
+    # consumes memory under load" and exists to put the node under genuine memory
+    # pressure, not to do useful work.
+    set -eu
+    data=""
+    while true; do
+      chunk="$(head -c 1048576 /dev/zero | tr '\0' 'x')"
+      data="${data}${chunk}"
+      echo "batch-loader: approx $(( ${#data} / 1048576 )) MiB resident"
+      sleep 1
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scoring-api
+  namespace: analytics
+  labels:
+    app: scoring-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scoring-api
+  template:
+    metadata:
+      labels:
+        app: scoring-api
+    spec:
+      # Bound to the unexplained PriorityClass. Correctly created, correctly bound,
+      # and irrelevant to kubelet eviction ordering -- priority affects scheduler
+      # preemption only.
+      priorityClassName: critical-scoring
+      containers:
+        - name: scoring-api
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            # DEFECT A: no limits at all, so QoS is Burstable. Under node memory
+            # pressure the kubelet ranks Burstable pods above their requests as
+            # eviction candidates ahead of Guaranteed pods.
+            requests:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scoring-api-svc
+  namespace: analytics
+spec:
+  selector:
+    app: scoring-api
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch-loader
+  namespace: analytics
+  labels:
+    app: batch-loader
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: batch-loader
+  template:
+    metadata:
+      labels:
+        app: batch-loader
+    spec:
+      containers:
+        - name: batch-loader
+          image: busybox:1.36
+          command: ["sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          # DEFECT B: no requests and no limits at all, so QoS is BestEffort. It is
+          # evicted first, restarts immediately, re-fills memory, and drives the node
+          # straight back into pressure -- both the first victim and the cause.
+      volumes:
+        - name: script
+          configMap:
+            name: batch-loader-script
+            defaultMode: 0555

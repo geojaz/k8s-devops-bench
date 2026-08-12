@@ -320,6 +320,8 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 total_tokens=tokens.total,
                 status=record.get("status", "") or "",
                 validated=bool(record.get("validated", False)),
+                sandboxed=manifest.sandboxed,
+                sandbox_image=manifest.sandbox_image,
             )
         )
     return rows

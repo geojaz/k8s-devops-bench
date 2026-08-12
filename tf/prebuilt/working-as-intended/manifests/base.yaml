@@ -1,0 +1,125 @@
+# working-as-intended seed: one healthy Deployment, and an HPA carrying two
+# unrelated facts about it.
+#
+# maxReplicas 2 is a deliberate, documented cost control -- NOT the defect. It is
+# annotated with the FinOps ticket and rationale that make it a decision rather than
+# an oversight, and the reported "problem" (the workload never scales past 2) is
+# exactly what this ceiling is for.
+#
+# minReplicas is 2, matching maxReplicas. The task's objective asserts
+# readyReplicas >= 2 as evidence the workload is still healthy after remediation, so
+# the floor has to be 2 -- with minReplicas 1 the HPA is free to (and, at 0% real
+# demand, will) scale the Deployment down to 1, which fails that objective before
+# an agent ever touches the cluster. Pinning the floor at 2 keeps the seed's own
+# success condition independent of whatever the HPA decides to do.
+#
+# The real defect is the utilization target below: 400%. scoring-api requests
+# 200m of CPU, so triggering a scale-up would require sustaining 800m. The
+# scoring-api container runs a duty-cycle load generator (see the ConfigMap below)
+# that holds it at roughly 50% of its request -- about 100m -- so the gap between
+# real utilization (~50%) and the target (400%) is real and observable, not just
+# asserted. The HPA has therefore never fired in its life, and the cost ceiling
+# has been masking that the autoscaler underneath it is inert. One defect, zero
+# symptoms: the ceiling has always kept it from ever mattering.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: analytics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scoring-api-load
+  namespace: analytics
+data:
+  run.sh: |
+    #!/bin/sh
+    # Duty-cycle CPU load generator standing in for scoring-api's real workload.
+    # There is no real service here -- this is a stand-in that exists to keep the
+    # container's actual CPU usage real and non-zero, the way batch-loader in the
+    # noisy-neighbor stack stands in for "something that consumes memory."
+    #
+    # Alternates 1 real second of a tight arithmetic loop ("busy") with 1 real
+    # second of sleep ("idle"), a 50/50 duty cycle timed off wall clock so it does
+    # not depend on how fast the node's CPU is. The container's cpu limit (below,
+    # 200m -- equal to its request) caps what the busy phase can actually use, so
+    # during "busy" the container is throttled to ~200m regardless of how hot the
+    # loop runs. Averaged across the full 2-second cycle that comes out to roughly
+    # (200m * 1s + 0m * 1s) / 2s = 100m, i.e. ~50% of the 200m request.
+    #
+    # LIMITATION: this is a coarse, uncalibrated loop (shell arithmetic and forked
+    # `date` calls in busybox, not a stress-testing tool), so the true average will
+    # vary somewhat with scheduler jitter and cgroup accounting granularity. It is
+    # tuned to land in the 40-60% band (80-120m), not to hit an exact number.
+    set -eu
+    while true; do
+      end=$(($(date +%s) + 1))
+      x=0
+      while [ "$(date +%s)" -lt "${end}" ]; do
+        x=$((x + 1))
+      done
+      sleep 1
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scoring-api
+  namespace: analytics
+  labels:
+    app: scoring-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scoring-api
+  template:
+    metadata:
+      labels:
+        app: scoring-api
+    spec:
+      containers:
+        - name: scoring-api
+          image: busybox:1.36
+          command: ["sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 200m
+              memory: 64Mi
+            limits:
+              # Equal to the request so the duty-cycle loop's "busy" phase is
+              # throttled to a known ceiling (~200m) instead of grabbing whatever
+              # spare CPU the node happens to have -- see the ConfigMap comment
+              # above for why that makes the duty cycle's average predictable.
+              cpu: 200m
+      volumes:
+        - name: script
+          configMap:
+            name: scoring-api-load
+            defaultMode: 0555
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: scoring-api-hpa
+  namespace: analytics
+  annotations:
+    acme.io/cost-control: "FINOPS-3312"
+    acme.io/max-replicas-rationale: "capped at 2 pending Q3 budget review"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: scoring-api
+  minReplicas: 2
+  maxReplicas: 2
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 400

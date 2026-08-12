@@ -1,0 +1,33 @@
+# nightly-backlog seed, part 2 of 2: the unrelated, entirely healthy workload that
+# takes the collateral damage.
+#
+# Applied by setup.sh ONLY after the pod quota already has ~11 of its 12 slots
+# consumed by pre-created backlog job pods. With only 1 slot free, one of these two
+# replicas is admitted and the other is refused by the quota, leaving
+# readyReplicas=1 against a desired 2 -- degraded, but through no fault of its own.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reconcile-api
+  namespace: reconcile
+  labels:
+    app: reconcile-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: reconcile-api
+  template:
+    metadata:
+      labels:
+        app: reconcile-api
+    spec:
+      containers:
+        - name: reconcile-api
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
