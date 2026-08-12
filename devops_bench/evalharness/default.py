@@ -48,8 +48,14 @@ from devops_bench.core import (
 from devops_bench.deployers.factory import get_deployer
 from devops_bench.evalharness.artifacts import collect_generated_files, snapshot_dir
 from devops_bench.evalharness.base import Harness
+from devops_bench.evalharness.hold import (
+    HOLD_POLL_INTERVAL_SEC,
+    HoldObservation,
+    SafeguardMonitor,
+    hold_verdict,
+    run_hold_window,
+)
 from devops_bench.evalharness.reporter import ResultReporter
-from devops_bench.evalharness.safeguard_monitor import HoldObservation, SafeguardMonitor
 from devops_bench.evalharness.scenario import (
     VERIFICATION_TIMEOUT_SEC,
     VERIFICATION_TOTAL_BUDGET_SEC,
@@ -546,21 +552,29 @@ class DefaultEvalHarness(Harness):
         to short-circuit an under-budget leaf as a definite "deadline
         exhausted" outcome, and this entry was never observed either way.
 
-        A ``hold`` entry is never evaluated fresh here: it was sampled on a
-        background thread across the agent's turn (see
-        ``devops_bench.evalharness.safeguard_monitor``), and its outcome comes
-        entirely from ``hold_observations`` instead. A hold entry with zero
-        samples is recorded as an error, not a silent pass: a safeguard
-        nobody watched must not read as a safeguard that held.
+        A ``hold`` entry is never evaluated with a single ``run_entry`` call
+        here, but the two roles reach their observation differently.  A
+        ``safeguard`` hold entry was already sampled on a background thread
+        across the agent's turn (see
+        ``devops_bench.evalharness.hold.SafeguardMonitor``), and its outcome
+        comes entirely from ``hold_observations``. An ``objective`` hold
+        entry is soaked right here instead, via
+        :func:`~devops_bench.evalharness.hold.run_hold_window`, against this
+        same total-budget deadline: an objective starts false and must
+        become true and stay true, which can only be observed after the
+        agent's turn ends. A hold entry with zero samples either way is
+        recorded as an error, not a silent pass: a hold nobody watched must
+        not read as one that held.
 
         Args:
             entries: The task's parsed verification entries.
             timeout_sec: Per-entry budget for converging entries.
             hold_observations: Name-keyed monitor observations for every
-                ``hold`` entry, as returned by
-                :meth:`~devops_bench.evalharness.safeguard_monitor.SafeguardMonitor.get_observations`.
+                ``safeguard``-role ``hold`` entry, as returned by
+                :meth:`~devops_bench.evalharness.hold.SafeguardMonitor.get_observations`.
                 ``None`` (or a missing name) is treated the same as zero
-                samples.
+                samples. Never consulted for ``objective``-role hold entries,
+                which are soaked in this same pass instead.
 
         Returns:
             One raw mapping per entry, in declaration order, carrying the
@@ -573,8 +587,32 @@ class DefaultEvalHarness(Harness):
         hold_observations = hold_observations or {}
 
         for entry in entries:
-            if entry.resolved_mode == "hold":
+            if entry.resolved_mode == "hold" and entry.role == "safeguard":
                 report.append(self._hold_report_entry(entry, hold_observations.get(entry.name)))
+                continue
+            if entry.resolved_mode == "hold" and entry.role == "objective":
+                # hold_window_sec is required for an objective hold entry;
+                # normally enforced by VerificationEntry's own validation, so
+                # reaching here without it means a spec-validation bug let an
+                # invalid entry through to verification.
+                if entry.hold_window_sec is None:
+                    raise ValueError(
+                        f"objective hold entry {entry.name!r} reached verification without "
+                        "hold_window_sec set; this should have been rejected at "
+                        "spec-validation time"
+                    )
+                interval_sec = (
+                    entry.hold_poll_interval_sec
+                    if entry.hold_poll_interval_sec is not None
+                    else HOLD_POLL_INTERVAL_SEC
+                )
+                obs = run_hold_window(
+                    entry,
+                    entry.hold_window_sec,
+                    interval_sec=interval_sec,
+                    deadline=total_deadline,
+                )
+                report.append(self._hold_report_entry(entry, obs))
                 continue
 
             remaining = total_deadline - time.monotonic()
@@ -632,20 +670,18 @@ class DefaultEvalHarness(Harness):
 
     @staticmethod
     def _hold_report_entry(entry: VerificationEntry, obs: HoldObservation | None) -> dict[str, Any]:
-        """Build one hold entry's report row from its monitor observation.
+        """Build one hold entry's report row from its driver's observation.
 
-        Passes only when the monitor took at least one sample and never saw a
-        violation. Zero samples (``obs`` is ``None`` or ``sample_count == 0``)
-        is recorded as an error, mirroring how a converge entry starved of
-        budget is recorded here: never observed, so it must not read as
-        having passed. A violation always fails, regardless of whether it was
-        still active at the last sample — a hold safeguard is about
-        continuous compliance, not the value at the end (which is exactly the
-        gap this mode exists to close).
+        The verdict itself (pass / fail / error, and why) is delegated to
+        :func:`~devops_bench.evalharness.hold.hold_verdict` so both hold
+        drivers (the live safeguard monitor and the post-run objective
+        window) are scored by exactly one rule. ``obs is None`` (the entry's
+        name was missing from ``hold_observations`` entirely) is treated the
+        same as a fresh, zero-sample observation.
 
         Args:
             entry: The hold-mode entry being reported.
-            obs: The monitor's observation for this entry, or ``None`` if the
+            obs: The driver's observation for this entry, or ``None`` if the
                 entry's name was missing from ``hold_observations`` entirely.
 
         Returns:
@@ -655,25 +691,7 @@ class DefaultEvalHarness(Harness):
             ``hold_first_violation_reason`` / ``hold_first_violation_at_sec``
             so the outcome is auditable from the report alone.
         """
-        if obs is None or obs.sample_count == 0:
-            success, status, reason = (
-                False,
-                "error",
-                "hold safeguard was never sampled by the monitor during the agent's "
-                "turn; a safeguard nobody watched must not read as one that held",
-            )
-        elif obs.violated:
-            success, status = False, "fail"
-            reason = (
-                f"hold violated {obs.first_violation_at_sec:.1f}s into the agent's "
-                f"turn: {obs.first_violation_reason}"
-            )
-        else:
-            success, status = True, "pass"
-            reason = (
-                f"held for {obs.sample_count} sample(s) across the agent's turn "
-                f"({obs.error_count} sample(s) could not be evaluated)"
-            )
+        success, status, reason = hold_verdict(obs if obs is not None else HoldObservation())
 
         return {
             "name": entry.name,
@@ -1011,14 +1029,23 @@ class DefaultEvalHarness(Harness):
                         _CHAOS_ACTIVE_WAIT_SEC,
                     )
 
-            # Hold entries must be observed continuously from here through the
-            # end of the agent's turn, not just at the moment verification
-            # runs after the agent exits (see safeguard_monitor's module
-            # docstring for the failure this closes). Started as close to the
-            # agent's turn as possible so a chaos-induced state change is not
-            # mistaken for an agent-caused violation.
-            hold_entries = [entry for entry in entries if entry.resolved_mode == "hold"]
-            safeguard_monitor = SafeguardMonitor(hold_entries)
+            # Safeguard hold entries must be observed continuously from here
+            # through the end of the agent's turn, not just at the moment
+            # verification runs after the agent exits (see hold's module
+            # docstring for the failure this closes). Started as close to
+            # the agent's turn as possible so a chaos-induced state change is
+            # not mistaken for an agent-caused violation. Objective hold
+            # entries are deliberately excluded here: an objective starts
+            # false and must become true, so sampling it live would latch a
+            # spurious violation before the agent has done anything. Those
+            # are soaked instead in the post-run verification pass (see
+            # ``_run_verification``).
+            safeguard_hold_entries = [
+                entry
+                for entry in entries
+                if entry.resolved_mode == "hold" and entry.role == "safeguard"
+            ]
+            safeguard_monitor = SafeguardMonitor(safeguard_hold_entries)
             safeguard_monitor.start()
 
             _log.info("executing agent for prompt: %s", prompt)

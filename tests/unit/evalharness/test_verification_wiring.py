@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 
 from devops_bench.evalharness.default import DefaultEvalHarness
-from devops_bench.evalharness.safeguard_monitor import HoldObservation
+from devops_bench.evalharness.hold import HoldObservation
 from devops_bench.verification.base import MIN_LEAF_BUDGET_SECONDS, VerificationResult
 from devops_bench.verification.spec import parse_entries
 
@@ -226,7 +226,13 @@ def test_hold_entry_bypasses_the_total_budget_and_run_entry_entirely(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A hold entry is scored from the monitor's observations, not budget-gated like converge."""
-    hold_spec = {**_SPEC[0], "name": "web-stays-ready", "mode": "hold"}
+    hold_spec = {
+        **_SPEC[0],
+        "name": "web-stays-ready",
+        "role": "safeguard",
+        "severity": "catastrophic",
+        "mode": "hold",
+    }
     entries, errors = parse_entries([_SPEC[0], hold_spec])
     assert errors == []
     # An exhausted total budget still starves the first (converging) entry;
