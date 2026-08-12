@@ -44,7 +44,7 @@ _thread_local = threading.local()
 def tag_current_thread(tag: str | None) -> None:
     """Set (or clear) a tag applied to every "running command" log line from this thread.
 
-    :class:`~devops_bench.evalharness.safeguard_monitor.SafeguardMonitor` runs
+    :class:`~devops_bench.evalharness.hold.SafeguardMonitor` runs
     its periodic sampling on its own daemon thread; without a tag, its
     ``kubectl`` calls are indistinguishable in the log from the agent's own
     activity. A thread-local flag needs no plumbing through the sampling call
