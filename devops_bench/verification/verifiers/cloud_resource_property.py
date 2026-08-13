@@ -190,8 +190,7 @@ class CloudResourcePropertyVerifier(BaseVerifier):
         argv: list[str] = [desc.binary, *self.args]
         if desc.context_flag and desc.context_env:
             explicit = any(
-                a == desc.context_flag or a.startswith(desc.context_flag + "=")
-                for a in self.args
+                a == desc.context_flag or a.startswith(desc.context_flag + "=") for a in self.args
             )
             ambient = get_env(desc.context_env)
             if not explicit and ambient:
@@ -225,10 +224,7 @@ class CloudResourcePropertyVerifier(BaseVerifier):
                 payload = json.loads(completed.stdout or "null")
             except json.JSONDecodeError as exc:
                 return "error", f"{desc.binary} produced non-JSON output: {exc}", None
-            if payload is None:
-                objects = []
-            else:
-                objects = payload if isinstance(payload, list) else [payload]
+            objects = [] if payload is None else payload if isinstance(payload, list) else [payload]
 
         if not objects:
             # A not-found exit and a legitimately empty listing both mean the

@@ -35,7 +35,9 @@ from devops_bench.verification.verifiers.cloud_resource_property import (
 _MODULE = "devops_bench.verification.verifiers.cloud_resource_property"
 
 
-def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+def _completed(
+    returncode: int = 0, stdout: str = "", stderr: str = ""
+) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(
         args=["gcloud"], returncode=returncode, stdout=stdout, stderr=stderr
     )
@@ -64,7 +66,15 @@ def test_appends_binary_and_format_json() -> None:
 
     argv = mock_run.call_args.args[0]
     assert argv[0] == "gcloud"
-    assert argv[1:8] == ["compute", "networks", "subnets", "describe", "s", "--region", "us-central1"]
+    assert argv[1:8] == [
+        "compute",
+        "networks",
+        "subnets",
+        "describe",
+        "s",
+        "--region",
+        "us-central1",
+    ]
     assert argv[-1] == "--format=json"
     assert "--project" not in argv
 
