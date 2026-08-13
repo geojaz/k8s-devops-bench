@@ -16,35 +16,37 @@
 
 The cloud-side sibling of ``resource_property``: same JSONPath dialect,
 operator table, and quantifier semantics (imported from
-``_property_semantics``, shared rather than reimplemented), applied to a
-resource fetched via a provider-dispatched
-:class:`~devops_bench.cloud.base.CloudResourceFetcher` instead of ``kubectl``.
+``_property_semantics``, shared rather than reimplemented), applied to the
+parsed JSON output of a read-only cloud CLI invocation that the task spec
+itself supplies in ``args``.
 
-``provider`` names a key in
-:data:`~devops_bench.cloud.base.RESOURCE_FETCHERS`; ``resource_type`` is a
-key into that provider's own resource-type registry (e.g.
-``"project_iam_policy"`` for GCP). Both are validated eagerly at
-spec-load time, along with ``path`` and any regex ``value``, so a bad spec
-fails before any cloud CLI call runs.
+The bench does not enumerate which cloud resources exist. ``args`` is the
+CLI invocation minus the binary, minus output-format flags, and (usually)
+minus the provider context flag. What the bench owns per provider is one
+frozen :class:`ProviderDescriptor`: the binary, the read-only verb
+allowlist, the JSON output flags, the not-found stderr markers, and how
+ambient context is injected (``--project`` from ``GCP_PROJECT_ID``).
+Grading never falls back to the CLI's own ambient config.
 
 A cloud CLI's "resource absent" and "caller lacks permission to look" both
-surface as a nonzero exit, and they are not the same claim: a fetcher raises
-``ResourceAbsentError`` only for a genuine not-found, which this verifier
-treats as an empty fetched-object set (never a `pass` by accident on the
-wrong grounds); anything else -- ``CloudProviderError``, malformed JSON, an
-unresolved project -- is ``status="error"``, never ``"fail"``.
+surface as a nonzero exit, and they are not the same claim: stderr matching
+a not-found marker is treated as an empty fetched-object set (so ``op:
+absent`` can pass on the right grounds); any other nonzero exit is
+``status="error"``, never ``"fail"``.
 """
 
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from jsonpath_ng.exceptions import JSONPathError as _JsonPathError
 from pydantic import model_validator
 
-from devops_bench.cloud import gcloud as _gcp
-from devops_bench.cloud.base import RESOURCE_FETCHERS, ResourceAbsentError
+from devops_bench.core import get_env
+from devops_bench.core.subprocess import run
 from devops_bench.verification.base import (
     VERIFIERS,
     BaseVerifier,
@@ -60,21 +62,55 @@ from devops_bench.verification.verifiers._property_semantics import (
     evaluate_matched_objects,
 )
 
-__all__ = ["CloudResourcePropertyVerifier"]
+__all__ = ["CloudResourcePropertyVerifier", "ProviderDescriptor"]
 
-# Provider name -> the module owning that provider's resource-type registry
-# (`known_resource_types`/`required_scope_fields`), used only for eager
-# spec-load validation. Widen alongside the `provider` Literal below when a
-# new provider lands.
-_RESOURCE_TYPE_REGISTRIES = {"gcp": _gcp}
+
+@dataclass(frozen=True)
+class ProviderDescriptor:
+    """Everything the bench knows about one cloud CLI, as constants.
+
+    Attributes:
+        binary: The CLI executable.
+        read_verbs: ``args`` must contain at least one of these tokens; the
+            only allowlist in the design, per provider rather than per
+            resource.
+        json_args: Output-format flags the verifier appends; a spec passing
+            its own is rejected at load time.
+        not_found_markers: Case-insensitive stderr substrings meaning "the
+            resource genuinely does not exist", checked on nonzero exit.
+        context_flag: Flag injected from ``context_env`` when the spec did
+            not pass it explicitly.
+        context_env: Environment variable supplying ``context_flag``'s value.
+    """
+
+    binary: str
+    read_verbs: frozenset[str]
+    json_args: tuple[str, ...]
+    not_found_markers: tuple[str, ...]
+    context_flag: str | None = None
+    context_env: str | None = None
+
+
+_GCP = ProviderDescriptor(
+    binary="gcloud",
+    read_verbs=frozenset({"list", "describe", "get-iam-policy"}),
+    json_args=("--format=json",),
+    not_found_markers=("was not found", "not_found", "no such", "does not exist"),
+    context_flag="--project",
+    context_env="GCP_PROJECT_ID",
+)
+
+# Adding a provider is one descriptor here plus widening the `provider`
+# Literal below; no protocol, no registry, no plugin machinery.
+_DESCRIPTORS: dict[str, ProviderDescriptor] = {"gcp": _GCP}
 
 
 def _object_label(obj: Any, index: int) -> str:
     """Best-effort display label for one fetched object.
 
-    Cloud JSON shapes vary by provider and resource type (unlike Kubernetes,
-    there is no uniform ``metadata.name``); fall back to a positional label
-    when a dict has no ``name`` field, or the object is not a dict at all.
+    Cloud JSON shapes vary by resource type (there is no uniform
+    ``metadata.name``); fall back to a positional label when a dict has no
+    ``name`` field, or the object is not a dict at all.
     """
     if isinstance(obj, dict):
         name = obj.get("name")
@@ -85,7 +121,7 @@ def _object_label(obj: Any, index: int) -> str:
 
 @VERIFIERS.register("cloud_resource_property")
 class CloudResourcePropertyVerifier(BaseVerifier):
-    """Compare a JSONPath property of a fetched cloud resource.
+    """Compare a JSONPath property of objects fetched by a spec-supplied CLI call.
 
     See the module docstring for the absent-vs-permission-denied distinction
     and the shared JSONPath/operator semantics with ``resource_property``.
@@ -93,10 +129,7 @@ class CloudResourcePropertyVerifier(BaseVerifier):
 
     type: Literal["cloud_resource_property"] = "cloud_resource_property"
     provider: Literal["gcp"] = "gcp"
-    resource_type: str
-    project: str | None = None
-    scope: dict[str, str] | None = None
-    resource_name: str | None = None
+    args: list[str]
     path: str | None = None
     op: Literal["eq", "ne", "gt", "gte", "lt", "lte", "exists", "absent", "contains", "matches"]
     value: Any = None
@@ -104,22 +137,20 @@ class CloudResourcePropertyVerifier(BaseVerifier):
 
     @model_validator(mode="after")
     def _check_shape(self) -> CloudResourcePropertyVerifier:
-        """Reject combinations that cannot mean anything at evaluation time."""
-        registry_module = _RESOURCE_TYPE_REGISTRIES[self.provider]
-        known = registry_module.known_resource_types()
-        if self.resource_type not in known:
+        """Reject specs that could mutate, or cannot mean anything, at load time."""
+        desc = _DESCRIPTORS[self.provider]
+        if not set(self.args) & desc.read_verbs:
             msg = (
-                f"resource_type {self.resource_type!r} is not known for provider "
-                f"{self.provider!r}; available: {sorted(known)}"
+                f"args {self.args!r} contain no read-only verb for provider "
+                f"{self.provider!r}; expected one of {sorted(desc.read_verbs)}"
             )
             raise ValueError(msg)
-        required = registry_module.required_scope_fields(self.resource_type)
-        have = set((self.scope or {}).keys())
-        missing = [name for name in required if name not in have]
-        if missing:
+        owned = {flag.split("=", 1)[0] for flag in desc.json_args}
+        clashing = [a for a in self.args if a.split("=", 1)[0] in owned]
+        if clashing:
             msg = (
-                f"resource_type {self.resource_type!r} requires scope field(s) "
-                f"{missing}; got scope={self.scope!r}"
+                f"args must not set the output format ({clashing!r}); the verifier "
+                f"appends {list(desc.json_args)!r} itself"
             )
             raise ValueError(msg)
         if self.op not in _SET_OPS and not self.path:
@@ -135,7 +166,7 @@ class CloudResourcePropertyVerifier(BaseVerifier):
             raise ValueError(msg)
         if self.op == "exists" and not self.path and self.across_matches:
             msg = (
-                "op 'exists' without 'path' applies to the fetched resource set "
+                "op 'exists' without 'path' applies to the fetched object set "
                 "and does not take 'across_matches'"
             )
             raise ValueError(msg)
@@ -153,30 +184,65 @@ class CloudResourcePropertyVerifier(BaseVerifier):
         """Poll the property until it holds or the budget runs out."""
         return self._poll_to_result(lambda: self._check(timeout_sec), timeout_sec)
 
+    def _assemble_argv(self) -> list[str]:
+        """The full command: binary, spec args, injected context, owned format flags."""
+        desc = _DESCRIPTORS[self.provider]
+        argv: list[str] = [desc.binary, *self.args]
+        if desc.context_flag and desc.context_env:
+            explicit = any(
+                a == desc.context_flag or a.startswith(desc.context_flag + "=")
+                for a in self.args
+            )
+            ambient = get_env(desc.context_env)
+            if not explicit and ambient:
+                argv += [desc.context_flag, ambient]
+        argv += list(desc.json_args)
+        return argv
+
     def _check(self, timeout_sec: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        """One evaluation pass: fetch, resolve matches, apply the operator."""
-        fetcher_cls = RESOURCE_FETCHERS.get(self.provider)
+        """One evaluation pass: run the CLI, parse JSON, apply the operator."""
+        desc = _DESCRIPTORS[self.provider]
         try:
-            payload = fetcher_cls().fetch(
-                self.resource_type,
-                project=self.project,
-                scope=self.scope or {},
-                resource_name=self.resource_name,
-                timeout=single_call_timeout(timeout_sec),
+            completed = run(
+                self._assemble_argv(), check=False, timeout=single_call_timeout(timeout_sec)
             )
-        except ResourceAbsentError:
+        except Exception as exc:  # noqa: BLE001 - a CLI failure is a check error
+            return "error", f"{desc.binary} invocation failed: {exc}", None
+
+        subject = " ".join(self.args)
+        if completed.returncode != 0:
+            stderr = (completed.stderr or "").strip()
+            lowered = stderr.lower()
+            if not any(marker in lowered for marker in desc.not_found_markers):
+                return (
+                    "error",
+                    f"{desc.binary} exited {completed.returncode}: {stderr or 'no stderr'}",
+                    None,
+                )
             objects: list[Any] = []
-        except Exception as exc:  # noqa: BLE001 - a fetch failure is a check error
-            return (
-                "error",
-                f"{self.provider} fetch for {self.resource_type} failed: {exc}",
-                None,
-            )
         else:
-            objects = payload if isinstance(payload, list) else [payload]
+            try:
+                payload = json.loads(completed.stdout or "null")
+            except json.JSONDecodeError as exc:
+                return "error", f"{desc.binary} produced non-JSON output: {exc}", None
+            if payload is None:
+                objects = []
+            else:
+                objects = payload if isinstance(payload, list) else [payload]
+
+        if not objects:
+            # A not-found exit and a legitimately empty listing both mean the
+            # same observation: nothing matched. `absent` asserts exactly
+            # that; a property op cannot hold on nothing, so it must FAIL,
+            # not error, mirroring resource_property's name-mode semantics.
+            raw = {"matched": 0, "names": []}
+            if self.op == "absent":
+                return "pass", f"{subject}: no objects, as required", raw
+            if self.path is not None:
+                return "fail", f"{subject}: no objects; property check cannot hold", raw
+            return "fail", f"{subject}: no objects", raw
 
         names = [_object_label(obj, i) for i, obj in enumerate(objects)]
-
         return evaluate_matched_objects(
-            self.op, self.value, self.across_matches, self.path, objects, names, self.resource_type
+            self.op, self.value, self.across_matches, self.path, objects, names, subject
         )
