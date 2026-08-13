@@ -65,11 +65,11 @@ from devops_bench.verification.base import (
     VerificationStatus,
 )
 
-# The two verifiers share one comparison vocabulary on purpose (see the
-# module docstring); reuse resource_property's operator table, and its
-# element-wise across_matches machinery, instead of maintaining a second
-# copy here.
-from devops_bench.verification.verifiers.resource_property import (
+# The property-comparison verifiers share one comparison vocabulary on
+# purpose (see the module docstring); reuse the shared operator table and
+# element-wise across_matches machinery instead of maintaining a second copy
+# here.
+from devops_bench.verification.verifiers._property_semantics import (
     _VALUE_OPS,
     _apply_op,
     _compile,
