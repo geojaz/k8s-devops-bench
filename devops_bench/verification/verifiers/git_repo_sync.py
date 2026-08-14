@@ -65,11 +65,11 @@ from devops_bench.verification.base import (
     VerificationStatus,
 )
 
-# The two verifiers share one comparison vocabulary on purpose (see the
-# module docstring); reuse resource_property's operator table, and its
-# element-wise across_matches machinery, instead of maintaining a second
-# copy here.
-from devops_bench.verification.verifiers.resource_property import (
+# The property-comparison verifiers share one comparison vocabulary on
+# purpose (see the module docstring); reuse the shared operator table and
+# element-wise across_matches machinery instead of maintaining a second copy
+# here.
+from devops_bench.verification.verifiers._property_semantics import (
     _VALUE_OPS,
     _apply_op,
     _compile,
@@ -376,7 +376,7 @@ class GitRepoSyncVerifier(BaseVerifier):
     ) -> list[tuple[bool, str]]:
         """Quantify ``across_matches`` over ``prefix``'s elements, not ``suffix``'s values.
 
-        Mirrors ``resource_property._evaluate_across_elements``: for every
+        Mirrors ``_property_semantics.evaluate_across_elements``: for every
         element ``prefix`` selects out of ``docs``, resolve ``suffix``
         relative to that element. ``every``: an element that does not
         resolve ``suffix`` FAILS outright; every resolved value must also
