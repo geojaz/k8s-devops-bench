@@ -115,6 +115,14 @@ def test_rejects_args_without_read_only_verb() -> None:
         )
 
 
+def test_read_verb_as_flag_value_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="read-only verb"):
+        CloudResourcePropertyVerifier(
+            args=["compute", "instances", "delete", "vm", "--zone", "list"],
+            op="exists",
+        )
+
+
 def test_accepts_each_read_only_verb() -> None:
     for verb in ("list", "describe", "get-iam-policy"):
         CloudResourcePropertyVerifier(args=["something", verb], op="exists")
@@ -239,6 +247,35 @@ def test_permission_stderr_is_error_never_absence() -> None:
 
     assert result.status == "error"
     assert result.success is False
+
+
+def test_not_found_wording_with_permission_clause_is_error() -> None:
+    with _patched_run(
+        _completed(
+            returncode=1,
+            stderr="ERROR: project ghost does not exist or you do not have permission to access it",
+        )
+    ):
+        result = CloudResourcePropertyVerifier(
+            args=["compute", "networks", "subnets", "describe", "ghost"],
+            op="absent",
+        ).verify(timeout_sec=0)
+
+    assert result.status == "error"
+    assert result.success is False
+
+
+def test_empty_list_with_across_matches_none_is_vacuously_true() -> None:
+    with _patched_run(_completed(stdout="[]")):
+        result = CloudResourcePropertyVerifier(
+            args=["compute", "instances", "list"],
+            path="status",
+            op="eq",
+            value="RUNNING",
+            across_matches="none",
+        ).verify(timeout_sec=0)
+
+    assert result.status == "pass"
 
 
 def test_non_json_stdout_is_error() -> None:

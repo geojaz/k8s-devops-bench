@@ -396,10 +396,16 @@ def evaluate_matched_objects(
             return "fail", f"{len(objects)} matching {subject} found: {names}", raw
         return "pass", f"no matching {subject}", raw
 
-    # Fail closed above the flattening. This is what keeps "zero objects
-    # existed" distinct from "objects existed but the path matched nothing":
-    # the former can never be observed, the latter is a real answer.
+    # Fail closed above the flattening for `every` (and the plain
+    # exactly-one-match case): "zero objects existed" is an unobservable
+    # predicate there, not a satisfied one, so it stays a fail. `none` is
+    # the exception: it asserts that no matched object violates `op`, and
+    # an empty match set vacuously satisfies that (e.g. a selector for a
+    # job backlog that has been fully drained, or a cloud list that legitimately
+    # returned nothing).
     if not objects:
+        if across_matches == "none":
+            return "pass", f"no {subject} matched the selector; nothing violates", raw
         return "fail", f"no {subject} matched", raw
 
     if op == "exists" and path is None:

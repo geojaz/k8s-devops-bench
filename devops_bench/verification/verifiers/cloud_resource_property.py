@@ -29,10 +29,12 @@ ambient context is injected (``--project`` from ``GCP_PROJECT_ID``).
 Grading never falls back to the CLI's own ambient config.
 
 A cloud CLI's "resource absent" and "caller lacks permission to look" both
-surface as a nonzero exit, and they are not the same claim: stderr matching
-a not-found marker is treated as an empty fetched-object set (so ``op:
-absent`` can pass on the right grounds); any other nonzero exit is
-``status="error"``, never ``"fail"``.
+surface as a nonzero exit, and they are not the same claim: stderr is
+checked against the permission markers first, since a permission failure can
+be worded to look like a not-found one; only then does a not-found marker
+match get treated as an empty fetched-object set (so ``op: absent`` can pass
+on the right grounds). Any other nonzero exit is ``status="error"``, never
+``"fail"``.
 """
 
 from __future__ import annotations
@@ -78,6 +80,10 @@ class ProviderDescriptor:
             its own is rejected at load time.
         not_found_markers: Case-insensitive stderr substrings meaning "the
             resource genuinely does not exist", checked on nonzero exit.
+        permission_markers: Case-insensitive stderr substrings meaning "the
+            caller lacks permission to look", checked before
+            ``not_found_markers`` since a permission failure can be worded to
+            look like a not-found one.
         context_flag: Flag injected from ``context_env`` when the spec did
             not pass it explicitly.
         context_env: Environment variable supplying ``context_flag``'s value.
@@ -87,6 +93,7 @@ class ProviderDescriptor:
     read_verbs: frozenset[str]
     json_args: tuple[str, ...]
     not_found_markers: tuple[str, ...]
+    permission_markers: tuple[str, ...] = ()
     context_flag: str | None = None
     context_env: str | None = None
 
@@ -96,6 +103,13 @@ _GCP = ProviderDescriptor(
     read_verbs=frozenset({"list", "describe", "get-iam-policy"}),
     json_args=("--format=json",),
     not_found_markers=("was not found", "not_found", "no such", "does not exist"),
+    permission_markers=(
+        "permission_denied",
+        "does not have permission",
+        "you do not have permission",
+        "insufficient authentication scopes",
+        "forbidden",
+    ),
     context_flag="--project",
     context_env="GCP_PROJECT_ID",
 )
@@ -139,7 +153,12 @@ class CloudResourcePropertyVerifier(BaseVerifier):
     def _check_shape(self) -> CloudResourcePropertyVerifier:
         """Reject specs that could mutate, or cannot mean anything, at load time."""
         desc = _DESCRIPTORS[self.provider]
-        if not set(self.args) & desc.read_verbs:
+        prefix = []
+        for token in self.args:
+            if token.startswith("-"):
+                break
+            prefix.append(token)
+        if not set(prefix) & desc.read_verbs:
             msg = (
                 f"args {self.args!r} contain no read-only verb for provider "
                 f"{self.provider!r}; expected one of {sorted(desc.read_verbs)}"
@@ -212,6 +231,12 @@ class CloudResourcePropertyVerifier(BaseVerifier):
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             lowered = stderr.lower()
+            if any(marker in lowered for marker in desc.permission_markers):
+                return (
+                    "error",
+                    f"{desc.binary} exited {completed.returncode}: {stderr or 'no stderr'}",
+                    None,
+                )
             if not any(marker in lowered for marker in desc.not_found_markers):
                 return (
                     "error",
@@ -225,18 +250,6 @@ class CloudResourcePropertyVerifier(BaseVerifier):
             except json.JSONDecodeError as exc:
                 return "error", f"{desc.binary} produced non-JSON output: {exc}", None
             objects = [] if payload is None else payload if isinstance(payload, list) else [payload]
-
-        if not objects:
-            # A not-found exit and a legitimately empty listing both mean the
-            # same observation: nothing matched. `absent` asserts exactly
-            # that; a property op cannot hold on nothing, so it must FAIL,
-            # not error, mirroring resource_property's name-mode semantics.
-            raw = {"matched": 0, "names": []}
-            if self.op == "absent":
-                return "pass", f"{subject}: no objects, as required", raw
-            if self.path is not None:
-                return "fail", f"{subject}: no objects; property check cannot hold", raw
-            return "fail", f"{subject}: no objects", raw
 
         names = [_object_label(obj, i) for i, obj in enumerate(objects)]
         return evaluate_matched_objects(
