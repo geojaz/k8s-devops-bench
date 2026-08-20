@@ -34,6 +34,17 @@ anything a task put IN that cluster, and a task that needs the agent to inspect 
 workload cannot use RBAC to hide that workload's own definition. Answer material
 must not be seeded into the cluster in the first place; see the factory's
 ``answer-leakage.md``.
+
+AUTH INSIDE THE SANDBOX, FOR EVERY ADAPTER. ADC / keyless Vertex and keyless
+Bedrock auth are unreachable in a sandboxed run, for all four adapters, not
+just the ones this comment lives next to. ``CLOUDSDK_CONFIG`` is allowlisted
+host-side (see ``scoped_env``), but that only decides what the *docker client*
+subprocess sees; the directory it points at is never mounted into the
+container, and no credential file is mounted either (see ``wrap_argv``'s own
+docstring). A sandboxed run therefore needs an explicit API key threaded
+through the adapter's own ``extra_env`` overlay; a keyless/ADC config that
+works unsandboxed will silently fail (or fall through to no credential at all)
+once ``BENCH_AGENT_SANDBOX`` is on.
 """
 
 from __future__ import annotations
@@ -47,14 +58,16 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from devops_bench.core import get_logger
-from devops_bench.core.errors import SubprocessError
+from devops_bench.core.errors import ConfigError, SubprocessError
 from devops_bench.core.subprocess import run
 
 __all__ = [
     "sandbox_enabled",
     "SANDBOX_CAPABLE_AGENT_TYPES",
+    "IMAGE_SUPPORTED_AGENT_TYPES",
     "sandbox_state",
     "sandbox_image",
+    "check_image_supports_agent_type",
     "build_agent_kubeconfig",
     "wrap_argv",
     "container_workspace_path",
@@ -253,6 +266,58 @@ def scoped_env() -> dict[str, str] | None:
 # something the operator chose, the run was never a candidate for containment
 # in the first place.
 SANDBOX_CAPABLE_AGENT_TYPES = frozenset({"gemini", "claude", "openclaw", "antigravity"})
+
+# The image tag hack/agent-sandbox.Dockerfile's own documented build command
+# produces. Used only to recognise "the operator is running the stock
+# reference image" in :func:`check_image_supports_agent_type`; a custom
+# BENCH_AGENT_IMAGE value is assumed to have been built (and vetted) by
+# whoever set it, so it is never checked against this list.
+_REFERENCE_SANDBOX_IMAGE = "devops-bench/agent-sandbox:dev"
+
+# Agent types the reference image actually has a CLI installed for (see
+# hack/agent-sandbox.Dockerfile). Kept next to SANDBOX_CAPABLE_AGENT_TYPES,
+# not merged into it, because the two answer different questions: "does this
+# harness know how to wrap the adapter's argv in docker run" versus "does the
+# stock reference image have that adapter's binary on it". openclaw and
+# antigravity are sandbox-capable (their harnesses honour BENCH_AGENT_SANDBOX)
+# but absent here: the reference image has no install recipe for `oc`/`agy`
+# (no known public/scriptable one exists yet), so a run against it would fail
+# inside the container with a confusing "binary not found" rather than a
+# clear configuration error. Keeping this list separate is what lets the two
+# facts diverge without one silently masking the other.
+IMAGE_SUPPORTED_AGENT_TYPES = frozenset({"gemini", "claude"})
+
+
+def check_image_supports_agent_type(agent_type: str) -> None:
+    """Raise before ``docker run`` if the configured image has no CLI for ``agent_type``.
+
+    A no-op for any ``agent_type`` in :data:`IMAGE_SUPPORTED_AGENT_TYPES`.
+    Otherwise, this only hard-fails when the operator is (as far as this
+    process can tell) about to run the stock :data:`_REFERENCE_SANDBOX_IMAGE`:
+    if ``BENCH_AGENT_IMAGE`` names anything else, it is treated as a custom
+    image an operator built to include the missing CLI, and this check gets
+    out of the way. Call this once, early, inside the ``sandbox_enabled()``
+    branch, before any docker invocation.
+
+    Args:
+        agent_type: Canonical agent-registry key for the adapter about to run.
+
+    Raises:
+        ConfigError: If ``agent_type`` is missing from the reference image and
+            no override image was configured.
+    """
+    if agent_type in IMAGE_SUPPORTED_AGENT_TYPES:
+        return
+    configured_image = os.environ.get("BENCH_AGENT_IMAGE", "").strip()
+    if configured_image and configured_image != _REFERENCE_SANDBOX_IMAGE:
+        return
+    raise ConfigError(
+        f"BENCH_AGENT_SANDBOX is set for the {agent_type!r} adapter, but the "
+        f"reference sandbox image ({_REFERENCE_SANDBOX_IMAGE}) has no install "
+        f"recipe for it (see the comment in hack/agent-sandbox.Dockerfile). "
+        "Set BENCH_AGENT_IMAGE to a custom image that installs the CLI to "
+        "override this check."
+    )
 
 
 def sandbox_state(agent_type: str) -> bool:

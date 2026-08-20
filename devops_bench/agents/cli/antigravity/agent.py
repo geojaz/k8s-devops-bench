@@ -212,6 +212,17 @@ class AgyCliAgent(base.AgentHarness):
         env_overlay = _build_env(self.config)
 
         with cli_capabilities.agent_workdir(workspace_path, prefix="agy-run-") as workdir:
+            if sandbox.sandbox_enabled():
+                # Fail fast, before any host-side prep (including the OAuth
+                # token copy below, which has its own cleanup-on-exit
+                # guarantee this exception must not bypass) or docker
+                # invocation: the reference sandbox image
+                # (hack/agent-sandbox.Dockerfile) has no install recipe for
+                # `agy` yet. Raises ConfigError, caught by AgentHarness.run's
+                # broad safety net and converted to an errored result, same
+                # as any other _execute exception.
+                sandbox.check_image_supports_agent_type("antigravity")
+
             gemini_dir = workdir / ".gemini"
             # <gemini_dir>/antigravity-cli/ is the single directory agy reads
             # its config from and writes its state to (see the OAuth token,

@@ -475,6 +475,12 @@ class OpenClawAgent(AgentHarness):
             # paths) is left untouched for the extraction calls below.
             container_name: str | None = None
             if sandbox.sandbox_enabled():
+                # Fail fast, before any docker invocation: the reference
+                # sandbox image (hack/agent-sandbox.Dockerfile) has no
+                # install recipe for `oc` yet. Raises ConfigError, caught by
+                # AgentHarness.run's broad safety net and converted to an
+                # errored result, same as any other _execute exception.
+                sandbox.check_image_supports_agent_type("openclaw")
                 sandboxed_env = dict(env_overlay)
                 for key in ("OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"):
                     if key in sandboxed_env:

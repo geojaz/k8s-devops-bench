@@ -264,6 +264,11 @@ def _claude_config_dir() -> Iterator[str | None]:
     # ignore_cleanup_errors: Claude Code may leave straggler state/lock files or
     # MCP-server children; a cleanup OSError must not turn a completed run into
     # an errored one via the base safety net.
+    #
+    # This host-side tmpdir is not shared with the sandbox container: under
+    # BENCH_AGENT_SANDBOX the container sees its own ephemeral path (discarded
+    # on exit), never this one, so the isolation this function provides only
+    # matters for unsandboxed runs.
     with tempfile.TemporaryDirectory(prefix="claude-config-", ignore_cleanup_errors=True) as tmpdir:
         yield tmpdir
 

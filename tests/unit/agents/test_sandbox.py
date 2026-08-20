@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from devops_bench.agents import sandbox
-from devops_bench.core.errors import SubprocessError
+from devops_bench.core.errors import ConfigError, SubprocessError
 
 
 def test_sandbox_state_true_only_for_capable_adapter_with_env_set(
@@ -657,3 +657,44 @@ def test_scoped_env_omits_an_allowlisted_key_absent_from_the_operator_env(
     monkeypatch.setenv("BENCH_AGENT_ENV_SCOPE", "allowlist")
     monkeypatch.delenv("NVM_DIR", raising=False)
     assert "NVM_DIR" not in sandbox.scoped_env()
+
+
+# ---------------------------------------------------------------------------
+# check_image_supports_agent_type: the reference sandbox image
+# (hack/agent-sandbox.Dockerfile) only installs gemini and claude, even
+# though SANDBOX_CAPABLE_AGENT_TYPES advertises all four adapters. This must
+# fail fast for the two unsupported adapters, unless the operator has pointed
+# BENCH_AGENT_IMAGE at their own custom image.
+# ---------------------------------------------------------------------------
+
+
+def test_check_image_supports_agent_type_raises_for_unsupported_agent_on_reference_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_IMAGE", raising=False)
+    with pytest.raises(ConfigError, match="openclaw"):
+        sandbox.check_image_supports_agent_type("openclaw")
+
+
+def test_check_image_supports_agent_type_raises_when_image_env_is_reference_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", sandbox._REFERENCE_SANDBOX_IMAGE)
+    with pytest.raises(ConfigError, match="antigravity"):
+        sandbox.check_image_supports_agent_type("antigravity")
+
+
+def test_check_image_supports_agent_type_allows_override_with_custom_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "my-custom-agent-image:latest")
+    sandbox.check_image_supports_agent_type("openclaw")  # must not raise
+    sandbox.check_image_supports_agent_type("antigravity")  # must not raise
+
+
+def test_check_image_supports_agent_type_never_raises_for_image_supported_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_IMAGE", raising=False)
+    sandbox.check_image_supports_agent_type("gemini")  # must not raise
+    sandbox.check_image_supports_agent_type("claude")  # must not raise
