@@ -616,3 +616,44 @@ def test_pid_alive_treats_permission_error_as_alive(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(sandbox.os, "kill", fake_kill)
     assert sandbox._pid_alive(1) is True
+
+
+# ---------------------------------------------------------------------------
+# Env scope: BENCH_AGENT_ENV_SCOPE=allowlist gives an agent subprocess a
+# scoped baseline environment instead of full inheritance. See
+# test_agents_cli_claude_code.py etc. for the per-adapter wiring this backs.
+# ---------------------------------------------------------------------------
+
+
+def test_scoped_env_none_when_scope_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BENCH_AGENT_ENV_SCOPE", raising=False)
+    assert sandbox.scoped_env() is None
+
+
+def test_scoped_env_none_for_an_unrecognised_scope_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_AGENT_ENV_SCOPE", "full")
+    assert sandbox.scoped_env() is None
+
+
+def test_scoped_env_allowlist_excludes_sentinel_and_agent_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_ENV_SCOPE", "allowlist")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("SENTINEL_NOT_ALLOWLISTED", "leak-me")
+    monkeypatch.setenv("AGENT_API_KEY", "should-not-cross")
+
+    env = sandbox.scoped_env()
+
+    assert env is not None
+    assert env["PATH"] == "/usr/bin"
+    assert "SENTINEL_NOT_ALLOWLISTED" not in env
+    assert "AGENT_API_KEY" not in env
+
+
+def test_scoped_env_omits_an_allowlisted_key_absent_from_the_operator_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_ENV_SCOPE", "allowlist")
+    monkeypatch.delenv("NVM_DIR", raising=False)
+    assert "NVM_DIR" not in sandbox.scoped_env()

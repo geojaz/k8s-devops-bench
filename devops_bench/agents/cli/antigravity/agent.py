@@ -351,6 +351,7 @@ class AgyCliAgent(base.AgentHarness):
                     try:
                         completed = devops_subprocess.run(
                             run_argv,
+                            env=sandbox.scoped_env(),
                             extra_env=env_overlay,
                             cwd=workdir,
                             check=False,

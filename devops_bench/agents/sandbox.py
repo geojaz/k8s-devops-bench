@@ -62,6 +62,8 @@ __all__ = [
     "kill_container",
     "container_guard",
     "sweep_stray_containers",
+    "env_scope_enabled",
+    "scoped_env",
 ]
 
 _log = get_logger("agents.sandbox")
@@ -182,6 +184,64 @@ def sandbox_enabled() -> bool:
     while tasks are still being debugged.
     """
     return os.environ.get("BENCH_AGENT_SANDBOX", "").strip().lower() in {"docker", "1", "true"}
+
+
+# Keys copied from the operator's own environment into an agent subprocess's
+# scoped baseline (see :func:`scoped_env`), when present. Deliberately narrow:
+# PATH/HOME/USER/LOGNAME/SHELL/TERM/LANG/LC_ALL/TMPDIR are the shell/locale
+# plumbing a CLI needs to run at all; KUBECONFIG/CLOUDSDK_CONFIG are the
+# cluster/cloud identity a task's own config grants; the *_PROXY trio is
+# network egress config, not a credential. NVM_DIR is here because openclaw's
+# ``oc`` invocation is a bash command that sources ``$NVM_DIR/nvm.sh`` (falling
+# back to ``$HOME/.nvm`` only when NVM_DIR is unset); an operator with Node
+# installed via nvm at a non-default path would otherwise silently lose Node
+# under the scoped environment. Deliberately excludes every ``AGENT_*``
+# harness-config variable (including AGENT_API_KEY): those reach the child
+# only through the adapter's own extra_env overlay, never this baseline.
+_ENV_ALLOWLIST_KEYS: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "KUBECONFIG",
+    "CLOUDSDK_CONFIG",
+    "NVM_DIR",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+)
+
+
+def env_scope_enabled() -> bool:
+    """True when agent subprocesses should get a scoped baseline environment.
+
+    Opt-in via ``BENCH_AGENT_ENV_SCOPE=allowlist`` rather than default, so
+    today's full-inheritance behaviour keeps working until a smoke sweep
+    validates the narrower environment across every adapter.
+    """
+    return os.environ.get("BENCH_AGENT_ENV_SCOPE", "").strip().lower() == "allowlist"
+
+
+def scoped_env() -> dict[str, str] | None:
+    """The baseline environment for an agent CLI subprocess.
+
+    Returns ``None`` (today's full-inheritance behaviour: the child inherits
+    the operator's entire environment) unless
+    ``BENCH_AGENT_ENV_SCOPE=allowlist`` is set, in which case it returns a
+    baseline built only from :data:`_ENV_ALLOWLIST_KEYS` present in the
+    operator's environment. Callers pass the result as ``core.subprocess.run``'s
+    ``env=`` argument alongside their existing ``extra_env=`` overlay; the
+    overlay is applied on top of this baseline, never replaced by it, so a
+    provider API key still reaches the child exactly as before.
+    """
+    if not env_scope_enabled():
+        return None
+    return {key: os.environ[key] for key in _ENV_ALLOWLIST_KEYS if key in os.environ}
 
 
 # Canonical agent-registry keys whose harness knows how to wrap its CLI in a

@@ -1294,3 +1294,48 @@ def test_execute_sandboxed_run_wraps_argv_in_docker(monkeypatch: pytest.MonkeyPa
     assert captured["extra_env"]["ANTHROPIC_API_KEY"] == secret
     assert "-e" in captured["argv"]
     assert "ANTHROPIC_API_KEY" in captured["argv"]
+
+
+# ---------------------------------------------------------------------------
+# Env scope: BENCH_AGENT_ENV_SCOPE=allowlist. See test_sandbox.py for
+# scoped_env() itself.
+# ---------------------------------------------------------------------------
+
+
+def test_execute_env_scope_off_passes_full_inheritance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BENCH_AGENT_ENV_SCOPE", raising=False)
+    captured: dict = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["env"] = kwargs.get("env")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
+
+    assert captured["env"] is None
+
+
+def test_execute_env_scope_allowlist_excludes_sentinel_and_agent_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_ENV_SCOPE", "allowlist")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("SENTINEL_NOT_ALLOWLISTED", "leak-me")
+    monkeypatch.setenv("AGENT_API_KEY", "should-not-cross")
+    secret = "SENTINEL-NOT-A-REAL-KEY-1111"
+    captured: dict = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["env"] = kwargs.get("env")
+        captured["extra_env"] = kwargs.get("extra_env")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    ClaudeCodeAgent(AgentConfig(target="claude", api_key=secret)).run("p")
+
+    env = captured["env"]
+    assert env["PATH"] == "/usr/bin"
+    assert "SENTINEL_NOT_ALLOWLISTED" not in env
+    assert "AGENT_API_KEY" not in env
+    assert captured["extra_env"]["ANTHROPIC_API_KEY"] == secret

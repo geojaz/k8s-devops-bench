@@ -519,6 +519,7 @@ class OpenClawAgent(AgentHarness):
                     # every value interpolated into `command` is shlex.quoted.
                     completed = run(
                         run_argv,
+                        env=sandbox.scoped_env(),
                         cwd=str(workdir),
                         extra_env=run_env_overlay,
                         check=False,

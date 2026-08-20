@@ -389,6 +389,7 @@ class ClaudeCodeAgent(AgentHarness):
                     try:
                         completed = run(
                             run_argv,
+                            env=sandbox.scoped_env(),
                             extra_env=env_overlay,
                             cwd=workdir,
                             check=False,

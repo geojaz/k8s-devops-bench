@@ -300,6 +300,7 @@ class GeminiCliAgent(AgentHarness):
                         # the bare `-e KEY` flags wrap_argv emitted have
                         # something to forward into the container. When not
                         # sandboxed, this is the pre-existing direct-run path.
+                        env=sandbox.scoped_env(),
                         extra_env=env_overlay,
                         cwd=workdir,
                         check=False,

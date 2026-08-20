@@ -1042,3 +1042,54 @@ def test_execute_sandboxed_run_wraps_argv_and_rewrites_state_paths(
     # the containerised oc process would look for its state at a host path
     # that does not exist inside the container.
     assert captured["extra_env"]["OPENCLAW_STATE_DIR"].startswith("/workspace")
+
+
+# ---------------------------------------------------------------------------
+# Env scope: BENCH_AGENT_ENV_SCOPE=allowlist. See test_sandbox.py for
+# scoped_env() itself.
+# ---------------------------------------------------------------------------
+
+
+def test_execute_env_scope_off_passes_full_inheritance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_ENV_SCOPE", raising=False)
+    captured: dict = {}
+
+    def dispatch(argv, **kwargs):
+        if argv[0] == "/bin/bash":
+            captured["env"] = kwargs.get("env")
+            return _make_subprocess_result(stdout="OK", returncode=0)
+        return _make_subprocess_result(stdout=json.dumps([]), returncode=0)
+
+    monkeypatch.setattr(oc_mod, "run", dispatch)
+    OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+
+    assert captured["env"] is None
+
+
+def test_execute_env_scope_allowlist_excludes_sentinel_and_agent_api_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_ENV_SCOPE", "allowlist")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("SENTINEL_NOT_ALLOWLISTED", "leak-me")
+    monkeypatch.setenv("AGENT_API_KEY", "should-not-cross")
+    secret = "SENTINEL-NOT-A-REAL-KEY-3333"
+    captured: dict = {}
+
+    def dispatch(argv, **kwargs):
+        if argv[0] == "/bin/bash":
+            captured["env"] = kwargs.get("env")
+            captured["extra_env"] = kwargs.get("extra_env")
+            return _make_subprocess_result(stdout="OK", returncode=0)
+        return _make_subprocess_result(stdout=json.dumps([]), returncode=0)
+
+    monkeypatch.setattr(oc_mod, "run", dispatch)
+    OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), api_key=secret)).run("p")
+
+    env = captured["env"]
+    assert env["PATH"] == "/usr/bin"
+    assert "SENTINEL_NOT_ALLOWLISTED" not in env
+    assert "AGENT_API_KEY" not in env
+    assert captured["extra_env"]["GEMINI_API_KEY"] == secret

@@ -968,3 +968,68 @@ def test_agy_cli_agent_execute_sandboxed_run_wraps_argv_and_rewrites_gemini_dir(
     # that does not exist inside the container.
     gemini_dir_flags = [a for a in captured["argv"] if a.startswith("--gemini_dir=")]
     assert gemini_dir_flags == ["--gemini_dir=/workspace/.gemini"]
+
+
+# ---------------------------------------------------------------------------
+# Env scope: BENCH_AGENT_ENV_SCOPE=allowlist. See test_sandbox.py for
+# scoped_env() itself.
+# ---------------------------------------------------------------------------
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_env_scope_off_passes_full_inheritance(
+    mock_run, mock_home, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("BENCH_AGENT_ENV_SCOPE", raising=False)
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    mock_home.return_value = tmp_path
+    captured: dict = {}
+
+    def side_effect(argv, **kwargs):
+        if kwargs.get("cwd") is None:
+            return SimpleNamespace(args=["gcloud"], returncode=1, stdout="", stderr="")
+        captured["env"] = kwargs.get("env")
+        return SimpleNamespace(args=argv, returncode=0, stdout="", stderr="")
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(target="/bin/agy", capabilities=capabilities.AllCapabilities())
+    agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert captured["env"] is None
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_env_scope_allowlist_excludes_sentinel_and_agent_api_key(
+    mock_run, mock_home, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    monkeypatch.setenv("BENCH_AGENT_ENV_SCOPE", "allowlist")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("SENTINEL_NOT_ALLOWLISTED", "leak-me")
+    monkeypatch.setenv("AGENT_API_KEY", "should-not-cross")
+    mock_home.return_value = tmp_path
+    secret = "SENTINEL-NOT-A-REAL-KEY-4444"
+    captured: dict = {}
+
+    def side_effect(argv, **kwargs):
+        if kwargs.get("cwd") is None:
+            return SimpleNamespace(args=["gcloud"], returncode=1, stdout="", stderr="")
+        captured["env"] = kwargs.get("env")
+        captured["extra_env"] = kwargs.get("extra_env")
+        return SimpleNamespace(args=argv, returncode=0, stdout="", stderr="")
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy", api_key=secret, capabilities=capabilities.AllCapabilities()
+    )
+    agy_mod.AgyCliAgent(config)._execute("run task")
+
+    env = captured["env"]
+    assert env["PATH"] == "/usr/bin"
+    assert "SENTINEL_NOT_ALLOWLISTED" not in env
+    assert "AGENT_API_KEY" not in env
+    assert captured["extra_env"]["GEMINI_API_KEY"] == secret
