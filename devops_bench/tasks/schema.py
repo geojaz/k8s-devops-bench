@@ -132,6 +132,13 @@ class Task(BaseModel):
         validated: Whether the task has been vetted as correct and is eligible to
             promote to the leaderboard. Defaults to ``False`` so an unvetted task
             never counts until explicitly marked.
+        task_version: Declared revision of this task spec (bumped by the task
+            generator on a semantic change). ``None`` when the spec omits it
+            (specs written before this field existed).
+        task_yaml_sha256: Lowercase hex sha256 of the raw ``task.yaml`` bytes
+            this task was parsed from, set by the loader rather than read from
+            the spec itself (mirrors :attr:`folder`). ``""`` when the task was
+            not loaded from a file (e.g. built directly from a dict).
     """
 
     model_config = _STRICT
@@ -148,6 +155,8 @@ class Task(BaseModel):
     infrastructure: dict[str, Any] = Field(default_factory=dict)
     documentation: list[DocumentationEntry] = Field(default_factory=list)
     validated: bool = False
+    task_version: int | None = None
+    task_yaml_sha256: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -175,7 +184,14 @@ class Task(BaseModel):
         )
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], *, name_default: str = "", folder: str = "") -> "Task":
+    def from_dict(
+        cls,
+        raw: dict[str, Any],
+        *,
+        name_default: str = "",
+        folder: str = "",
+        task_yaml_sha256: str = "",
+    ) -> "Task":
         """Build a task from a parsed spec mapping, validating types strictly.
 
         Adapts the source naming before validation: ``task_id`` is accepted as an
@@ -188,6 +204,9 @@ class Task(BaseModel):
             name_default: Name used when the mapping omits ``name``.
             folder: Directory name the spec was loaded from, recorded on
                 :attr:`folder`.
+            task_yaml_sha256: Content hash of the raw spec bytes, recorded on
+                :attr:`task_yaml_sha256`; supplied by the loader, not read from
+                ``raw`` itself.
 
         Returns:
             The validated task.
@@ -226,6 +245,8 @@ class Task(BaseModel):
                 "infrastructure": {} if infrastructure is None else infrastructure,
                 "documentation": [] if documentation is None else documentation,
                 "validated": False if validated is None else validated,
+                "task_version": raw.get("task_version"),
+                "task_yaml_sha256": task_yaml_sha256,
             }
         )
 

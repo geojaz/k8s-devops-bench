@@ -14,6 +14,7 @@
 
 """Unit tests for devops_bench.tasks.loader using real temp directories."""
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -318,3 +319,42 @@ def test_filesystem_task_loader_loads_directory(tmp_path):
     _write(tmp_path / "t" / "task.yaml", 'task_id: 1\nname: "t"\nprompt: "p"\n')
     tasks = FileSystemTaskLoader().load_tasks(str(tmp_path))
     assert [t.name for t in tasks] == ["t"]
+
+
+def test_task_version_absent_defaults_none_with_hash(tmp_path):
+    # No task_version key at all: the field must record None, not be dropped,
+    # and the loader must still hash the exact bytes it read.
+    content = 'task_id: 1\nname: "no-version"\nprompt: "p"\n'
+    path = tmp_path / "t" / "task.yaml"
+    _write(path, content)
+
+    tasks = load_from_tasks_dir(str(tmp_path))
+    assert len(tasks) == 1
+    assert tasks[0].task_version is None
+    assert tasks[0].task_yaml_sha256 == hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def test_task_version_present_is_recorded(tmp_path):
+    content = 'task_id: 1\nname: "versioned"\nprompt: "p"\ntask_version: 2\n'
+    path = tmp_path / "t" / "task.yaml"
+    _write(path, content)
+
+    tasks = load_from_tasks_dir(str(tmp_path))
+    assert len(tasks) == 1
+    assert tasks[0].task_version == 2
+    assert tasks[0].task_yaml_sha256 == hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def test_task_yaml_sha256_matches_independent_hash_of_fixture_bytes(tmp_path):
+    # The hash the loader records must match a hash computed independently
+    # (outside the loader) over the exact bytes on disk.
+    content = (
+        'task_id: 42\nname: "hash-check"\nprompt: "p"\nexpected_output: "e"\ntask_version: 3\n'
+    )
+    path = tmp_path / "t" / "task.yaml"
+    _write(path, content)
+
+    expected = hashlib.sha256(path.read_bytes()).hexdigest()
+    tasks = load_from_tasks_dir(str(tmp_path))
+    assert tasks[0].task_yaml_sha256 == expected
+    assert len(expected) == 64

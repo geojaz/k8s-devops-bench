@@ -97,6 +97,28 @@ def test_defaults_for_empty_mapping():
     assert task.verification_spec is None
     assert task.infrastructure == {}
     assert task.documentation == []
+    assert task.task_version is None
+    assert task.task_yaml_sha256 == ""
+
+
+def test_task_version_absent_defaults_to_none():
+    task = Task.from_dict({"prompt": "x"}, name_default="d")
+    assert task.task_version is None
+
+
+def test_task_version_recorded_when_present():
+    task = Task.from_dict({"prompt": "x", "task_version": 2}, name_default="d")
+    assert task.task_version == 2
+
+
+def test_task_yaml_sha256_defaults_to_empty_string():
+    task = Task.from_dict({"prompt": "x"}, name_default="d")
+    assert task.task_yaml_sha256 == ""
+
+
+def test_task_yaml_sha256_passed_through_from_loader():
+    task = Task.from_dict({"prompt": "x"}, name_default="d", task_yaml_sha256="a" * 64)
+    assert task.task_yaml_sha256 == "a" * 64
 
 
 def test_non_string_prompt_raises():
@@ -224,6 +246,8 @@ def test_to_dict_roundtrip_fields():
         "infrastructure",
         "documentation",
         "validated",
+        "task_version",
+        "task_yaml_sha256",
     }
 
 

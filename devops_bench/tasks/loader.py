@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -71,10 +72,14 @@ def _load_yaml_task(path: Path, name_default: str, folder: str = "") -> Task | N
     Returns:
         The parsed task, or ``None`` when the document is not a mapping.
     """
-    content = safe_parse_yaml(path.read_text(encoding="utf-8"))
+    raw_bytes = path.read_bytes()
+    content = safe_parse_yaml(raw_bytes.decode("utf-8"))
     if not isinstance(content, dict):
         return None
-    return Task.from_dict(content, name_default=name_default, folder=folder)
+    task_yaml_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    return Task.from_dict(
+        content, name_default=name_default, folder=folder, task_yaml_sha256=task_yaml_sha256
+    )
 
 
 def load_from_tasks_dir(dir_path: str) -> list[Task]:
