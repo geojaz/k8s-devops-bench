@@ -57,6 +57,7 @@ __all__ = [
     "sandbox_image",
     "build_agent_kubeconfig",
     "wrap_argv",
+    "container_workspace_path",
     "container_name_for_workspace",
     "kill_container",
     "container_guard",
@@ -99,6 +100,10 @@ _DOCKER_MAX_ID = 2147483647
 # Mirrors the port-forward teardown grace period in k8s.kubectl
 # (_PORT_FORWARD_TERM_GRACE_SEC).
 _CONTAINER_TERM_GRACE_SEC = 5
+
+# Where wrap_argv mounts ``workspace`` inside the container. Named so
+# :func:`container_workspace_path` and :func:`wrap_argv` cannot drift apart.
+_CONTAINER_WORKSPACE = "/workspace"
 
 
 def _boot_id() -> str:
@@ -179,13 +184,15 @@ def sandbox_enabled() -> bool:
     return os.environ.get("BENCH_AGENT_SANDBOX", "").strip().lower() in {"docker", "1", "true"}
 
 
-# Canonical agent-registry keys whose harness actually knows how to wrap its
-# CLI in a container (see agents/cli/gemini_cli/agent.py, the only caller of
-# wrap_argv). ``antigravity``, ``openclaw`` and ``api`` invoke their agent
-# directly and never read BENCH_AGENT_SANDBOX at all, so for those adapters
-# "sandbox off" is not something the operator chose; the run was never a
-# candidate for containment in the first place.
-SANDBOX_CAPABLE_AGENT_TYPES = frozenset({"gemini"})
+# Canonical agent-registry keys whose harness knows how to wrap its CLI in a
+# container (see agents/cli/gemini_cli/agent.py, agents/cli/claude_code/agent.py,
+# agents/cli/openclaw/agent.py and agents/cli/antigravity/agent.py, the callers
+# of wrap_argv). ``api`` drives its tool-use loop in-process rather than
+# spawning a CLI binary, so there is no subprocess to containerise and it never
+# reads BENCH_AGENT_SANDBOX at all: for that adapter "sandbox off" is not
+# something the operator chose, the run was never a candidate for containment
+# in the first place.
+SANDBOX_CAPABLE_AGENT_TYPES = frozenset({"gemini", "claude", "openclaw", "antigravity"})
 
 
 def sandbox_state(agent_type: str) -> bool:
@@ -193,15 +200,16 @@ def sandbox_state(agent_type: str) -> bool:
 
     Returns True only when ``agent_type`` is one of
     :data:`SANDBOX_CAPABLE_AGENT_TYPES` AND :func:`sandbox_enabled` is set,
-    the same two conditions the gemini CLI harness itself checks before
+    the same two conditions each capable CLI harness itself checks before
     wrapping its argv in ``docker run``. Every other combination is False:
-    an unset/falsy env var on the gemini path is "off by choice", and any
-    non-gemini adapter is "not applicable" because it cannot containerise
-    regardless of the env var. Both collapse to False here rather than to
-    some third value, because this function records only the run's actual,
-    observable state ("did this process execute inside a container"), which
-    is identical for both cases. The reason a run was not sandboxed is not
-    recoverable from the run itself and is not what this field is for.
+    an unset/falsy env var on a capable adapter's path is "off by choice", and
+    an incapable adapter (``api``) is "not applicable" because it cannot
+    containerise regardless of the env var. Both collapse to False here
+    rather than to some third value, because this function records only the
+    run's actual, observable state ("did this process execute inside a
+    container"), which is identical for both cases. The reason a run was not
+    sandboxed is not recoverable from the run itself and is not what this
+    field is for.
 
     Callers pass the canonical (alias-resolved) agent key, matching what
     :data:`SANDBOX_CAPABLE_AGENT_TYPES` is keyed on.
@@ -480,7 +488,7 @@ def wrap_argv(
         # original argv untouched; the trap runs after it returns or the shell
         # is signalled. SIGKILL cannot be trapped, so this does not cover
         # kill_container's SIGKILL escalation; see the docstring above.
-        chown_back = f"trap 'chown -R {uid}:{gid} /workspace' EXIT; \"$@\""
+        chown_back = f"trap 'chown -R {uid}:{gid} {_CONTAINER_WORKSPACE}' EXIT; \"$@\""
         command = ["sh", "-c", chown_back, "--", *argv]
 
     return [
@@ -497,19 +505,50 @@ def wrap_argv(
         "--user",
         user_spec,
         "-v",
-        f"{workspace}:/workspace",
+        f"{workspace}:{_CONTAINER_WORKSPACE}",
         "-v",
         f"{kubeconfig}:/kubeconfig:ro",
         "-e",
         "KUBECONFIG=/kubeconfig",
         "-e",
-        "HOME=/workspace",
+        f"HOME={_CONTAINER_WORKSPACE}",
         "-w",
-        "/workspace",
+        _CONTAINER_WORKSPACE,
         *env_flags,
         image,
         *command,
     ]
+
+
+def container_workspace_path(host_path: Path, *, workspace: Path) -> str:
+    """Rewrite a path under ``workspace`` to where it lands inside the container.
+
+    ``wrap_argv`` mounts ``workspace`` at :data:`_CONTAINER_WORKSPACE`, but a
+    caller that already resolved an absolute host path for a subdirectory of
+    ``workspace`` (e.g. an adapter's own state dir, built before it knew
+    whether this run would be sandboxed) cannot pass that host path into argv
+    or an env value crossing the container boundary: the host's temp root is
+    not mounted, only ``workspace`` is. Any such value must be rewritten
+    through this function first, or the CLI inside the container silently
+    reads/writes a directory that is never connected to the collected
+    workspace.
+
+    Args:
+        host_path: An absolute path that is ``workspace`` itself or nested
+            under it.
+        workspace: The same directory passed as ``wrap_argv``'s ``workspace``.
+
+    Returns:
+        The equivalent path as seen from inside the container.
+
+    Raises:
+        ValueError: If ``host_path`` is not ``workspace`` or one of its
+            descendants; such a path has no equivalent inside the container.
+    """
+    relative = host_path.relative_to(workspace)
+    if str(relative) == ".":
+        return _CONTAINER_WORKSPACE
+    return f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
 
 
 def container_name_for_workspace(workspace: Path) -> str:

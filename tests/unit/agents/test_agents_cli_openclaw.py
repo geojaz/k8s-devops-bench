@@ -973,3 +973,72 @@ def test_execute_cleans_up_temp_working_dir_after_run(
     OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
     assert captured["cwd"] is not None
     assert not os.path.exists(captured["cwd"])
+
+
+# ---------------------------------------------------------------------------
+# Sandbox wiring: BENCH_AGENT_SANDBOX=docker wraps the oc turn the same way
+# it already does for gemini_cli. See test_sandbox.py for wrap_argv itself
+# and test_agents_cli_claude_code.py for the pattern this mirrors. Unlike
+# claude/gemini, the wrapped argv here is ["docker", ...] rather than a
+# "/bin/bash"-prefixed argv, so these tests dispatch on argv[0] directly
+# instead of using _install_oc_run's bash/core split.
+# ---------------------------------------------------------------------------
+
+
+def _enable_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "agent-image")
+    monkeypatch.setattr(oc_mod.sandbox, "current_cluster_name", lambda: "kind")
+    monkeypatch.setattr(
+        oc_mod.sandbox,
+        "build_agent_kubeconfig",
+        lambda cluster, dest_dir: dest_dir / "kubeconfig",
+    )
+
+
+def test_execute_sandbox_off_leaves_argv_unwrapped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    captured: dict = {}
+
+    def dispatch(argv, **kwargs):
+        if argv[0] == "/bin/bash":
+            captured["argv"] = argv
+            return _make_subprocess_result(stdout="OK", returncode=0)
+        return _make_subprocess_result(stdout=json.dumps([]), returncode=0)
+
+    monkeypatch.setattr(oc_mod, "run", dispatch)
+    OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+
+    assert captured["argv"][0] == "/bin/bash"
+    assert "docker" not in captured["argv"]
+
+
+def test_execute_sandboxed_run_wraps_argv_and_rewrites_state_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_sandbox(monkeypatch)
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    captured: dict = {}
+
+    def dispatch(argv, **kwargs):
+        if argv[0] == "docker":
+            captured["argv"] = argv
+            captured["extra_env"] = kwargs.get("extra_env")
+            return _make_subprocess_result(stdout="OK", returncode=0)
+        return _make_subprocess_result(stdout=json.dumps([]), returncode=0)
+
+    monkeypatch.setattr(oc_mod, "run", dispatch)
+    OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), api_key=secret)).run("p")
+
+    assert captured["argv"][0] == "docker"
+    assert secret not in " ".join(captured["argv"])
+    assert captured["extra_env"]["GEMINI_API_KEY"] == secret
+    assert "-e" in captured["argv"]
+    assert "GEMINI_API_KEY" in captured["argv"]
+    # OPENCLAW_STATE_DIR is an absolute host path under the per-run workdir;
+    # under the sandbox it must be rewritten to its /workspace equivalent, or
+    # the containerised oc process would look for its state at a host path
+    # that does not exist inside the container.
+    assert captured["extra_env"]["OPENCLAW_STATE_DIR"].startswith("/workspace")

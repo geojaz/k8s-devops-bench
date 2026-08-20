@@ -51,6 +51,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
+from devops_bench.agents import sandbox
 from devops_bench.agents.base import AGENTS, AgentHarness
 from devops_bench.agents.cli.claude_code.parsing import parse_stream_json
 from devops_bench.agents.config import AgentConfig
@@ -341,40 +342,87 @@ class ClaudeCodeAgent(AgentHarness):
             )
             with _claude_config_dir() as config_dir:
                 env_overlay = _build_env(self.config, config_dir=config_dir)
-                try:
-                    completed = run(
-                        argv,
-                        extra_env=env_overlay,
-                        cwd=workdir,
-                        check=False,
-                        timeout=self.config.timeout_sec,
+
+                # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker.
+                # Mirrors gemini_cli/agent.py: everything above still runs on the
+                # host (CLAUDE.md, the MCP config, the skills tree are written
+                # into `workdir`, mounted into the container as /workspace); only
+                # the agent process itself moves. `env_overlay` crosses by NAME
+                # only in argv (wrap_argv's bare `-e KEY` flags); the VALUE
+                # crosses through the docker client subprocess's own environment
+                # (run()'s extra_env, below).
+                run_argv = argv
+                container_name: str | None = None
+                if sandbox.sandbox_enabled():
+                    cluster = sandbox.current_cluster_name()
+                    kubeconfig = (
+                        sandbox.build_agent_kubeconfig(cluster, workdir) if cluster else None
                     )
-                except SubprocessError as exc:
-                    # str(exc) embeds the child's full stderr, so rebuild the
-                    # message from the clipped tail rather than interpolating it.
-                    stderr = _stderr_tail(exc.stderr)
-                    reason = (
-                        f"claude subprocess error: exit {exc.returncode}: {stderr or '<no stderr>'}"
-                    )
-                    # A timeout raises with the partial stream-json captured
-                    # before the kill; recover the trajectory instead of dropping it.
-                    if exc.stdout:
-                        output, trajectory, tokens, parse_errors = parse_stream_json(exc.stdout)
-                        metadata: dict = {"returncode": exc.returncode}
-                        if stderr:
-                            metadata["stderr"] = stderr
-                        return AgentResult(
-                            output=output or reason,
-                            trajectory=trajectory,
-                            tokens=tokens,
-                            errors=[*parse_errors, reason],
-                            metadata=metadata,
+                    if kubeconfig is None:
+                        # Refuse rather than silently running unsandboxed on the
+                        # host: a containment control that quietly degrades is
+                        # worse than none.
+                        return _errored_with_tokens(
+                            "BENCH_AGENT_SANDBOX is set but no sandbox kubeconfig could "
+                            "be built; refusing to fall back to an unsandboxed run"
                         )
-                    return _errored_with_tokens(reason, stderr=exc.stderr)
-                except OSError as exc:
-                    # Spawn failure core.subprocess.run does not wrap: usually a
-                    # missing / non-executable binary, but also a vanished cwd.
-                    return _errored_with_tokens(f"failed to spawn claude: {exc}")
+                    container_name = sandbox.container_name_for_workspace(workdir)
+                    run_argv = sandbox.wrap_argv(
+                        argv,
+                        workspace=workdir,
+                        kubeconfig=kubeconfig,
+                        extra_env=env_overlay,
+                        container_name=container_name,
+                    )
+
+                # container_guard reaps the sandbox container by name on every
+                # exit from this block, normal or not: `--rm` alone only cleans
+                # up when the container's own process exits, not when the
+                # timeout below kills the local `docker run` client out from
+                # under it.
+                guard = (
+                    sandbox.container_guard(container_name)
+                    if container_name is not None
+                    else contextlib.nullcontext()
+                )
+                with guard:
+                    try:
+                        completed = run(
+                            run_argv,
+                            extra_env=env_overlay,
+                            cwd=workdir,
+                            check=False,
+                            timeout=self.config.timeout_sec,
+                        )
+                    except SubprocessError as exc:
+                        # str(exc) embeds the child's full stderr, so rebuild the
+                        # message from the clipped tail rather than interpolating it.
+                        stderr = _stderr_tail(exc.stderr)
+                        reason = (
+                            f"claude subprocess error: exit {exc.returncode}: "
+                            f"{stderr or '<no stderr>'}"
+                        )
+                        # A timeout raises with the partial stream-json captured
+                        # before the kill; recover the trajectory instead of dropping it.
+                        if exc.stdout:
+                            output, trajectory, tokens, parse_errors = parse_stream_json(
+                                exc.stdout
+                            )
+                            metadata: dict = {"returncode": exc.returncode}
+                            if stderr:
+                                metadata["stderr"] = stderr
+                            return AgentResult(
+                                output=output or reason,
+                                trajectory=trajectory,
+                                tokens=tokens,
+                                errors=[*parse_errors, reason],
+                                metadata=metadata,
+                            )
+                        return _errored_with_tokens(reason, stderr=exc.stderr)
+                    except OSError as exc:
+                        # Spawn failure core.subprocess.run does not wrap: usually a
+                        # missing / non-executable binary, but also a vanished cwd.
+                        return _errored_with_tokens(f"failed to spawn claude: {exc}")
 
         output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
         errors: list[str] = list(parse_errors)

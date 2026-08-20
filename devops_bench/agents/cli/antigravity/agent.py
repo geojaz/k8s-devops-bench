@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -27,6 +28,7 @@ from devops_bench import core
 from devops_bench.agents import base
 from devops_bench.agents import config as agents_config
 from devops_bench.agents import result as agents_result
+from devops_bench.agents import sandbox
 from devops_bench.agents.cli.antigravity import parsing
 from devops_bench.agents.shared import cli_capabilities
 from devops_bench.agents.shared.signal_death import classify_returncode
@@ -240,10 +242,20 @@ class AgyCliAgent(base.AgentHarness):
                 env_overlay["GCP_LOCATION"] = location
 
             # Explicit gemini_dir keeps agy on the workspace settings, not real HOME.
+            # Under the sandbox only `workdir` crosses into the container (mounted
+            # at /workspace); `gemini_dir` is a host path nested under it, so the
+            # flag value has to be rewritten to its /workspace-relative equivalent
+            # or the containerised agy would look for its config directory at a
+            # host path that does not exist inside the container.
+            argv_gemini_dir = (
+                sandbox.container_workspace_path(gemini_dir, workspace=workdir)
+                if sandbox.sandbox_enabled()
+                else str(gemini_dir)
+            )
             argv = [
                 binary,
                 "--dangerously-skip-permissions",
-                f"--gemini_dir={gemini_dir}",
+                f"--gemini_dir={argv_gemini_dir}",
             ]
             if project:
                 argv.append(f"--project={project}")
@@ -293,26 +305,68 @@ class AgyCliAgent(base.AgentHarness):
             else:
                 _log.warning("Real OAuth token not found at %s", real_token)
 
+            # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker.
+            # Mirrors gemini_cli/agent.py: everything above still runs on the
+            # host (GEMINI.md/.agents, settings.json, the skills tree and the
+            # copied OAuth token are written into `workdir`, mounted into the
+            # container as /workspace); only the agy process itself moves. The
+            # copied token above is what stands in for the "preserve real HOME"
+            # behaviour this adapter otherwise relies on: wrap_argv deliberately
+            # never mounts the operator's real HOME or ADC.
+            run_argv = argv
+            container_name: str | None = None
+            if sandbox.sandbox_enabled():
+                cluster = sandbox.current_cluster_name()
+                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir) if cluster else None
+                if kubeconfig is None:
+                    # Refuse rather than silently running unsandboxed on the
+                    # host: a containment control that quietly degrades is
+                    # worse than none.
+                    return agents_result.AgentResult.errored(
+                        "BENCH_AGENT_SANDBOX is set but no sandbox kubeconfig could be "
+                        "built; refusing to fall back to an unsandboxed run"
+                    )
+                container_name = sandbox.container_name_for_workspace(workdir)
+                run_argv = sandbox.wrap_argv(
+                    argv,
+                    workspace=workdir,
+                    kubeconfig=kubeconfig,
+                    extra_env=env_overlay,
+                    container_name=container_name,
+                )
+
             completed: devops_subprocess.CompletedProcess | None = None
             timeout_exc: core.SubprocessError | None = None
+            # container_guard reaps the sandbox container by name on every exit
+            # from this block, normal or not: `--rm` alone only cleans up when
+            # the container's own process exits, not when the timeout below
+            # kills the local `docker run` client out from under it.
+            guard = (
+                sandbox.container_guard(container_name)
+                if container_name is not None
+                else contextlib.nullcontext()
+            )
             try:
-                completed = devops_subprocess.run(
-                    argv,
-                    extra_env=env_overlay,
-                    cwd=workdir,
-                    check=False,
-                    timeout=self.config.timeout_sec,
-                )
-            except core.SubprocessError as exc:
-                # check=False means this can only be a timeout. agy may have
-                # already written a partial transcript before being killed,
-                # so fall through to recover it instead of returning early
-                # and losing the workspace to the `with` block's cleanup.
-                timeout_exc = exc
-            except OSError as exc:
-                return agents_result.AgentResult.errored(
-                    f"antigravity-cli binary unavailable: {exc}"
-                )
+                with guard:
+                    try:
+                        completed = devops_subprocess.run(
+                            run_argv,
+                            extra_env=env_overlay,
+                            cwd=workdir,
+                            check=False,
+                            timeout=self.config.timeout_sec,
+                        )
+                    except core.SubprocessError as exc:
+                        # check=False means this can only be a timeout. agy may
+                        # have already written a partial transcript before
+                        # being killed, so fall through to recover it instead
+                        # of returning early and losing the workspace to the
+                        # `with` block's cleanup.
+                        timeout_exc = exc
+                    except OSError as exc:
+                        return agents_result.AgentResult.errored(
+                            f"antigravity-cli binary unavailable: {exc}"
+                        )
             finally:
                 # agy only needs the token while running. Remove the copy once it
                 # exits so the live credential never lingers in a workspace that

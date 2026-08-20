@@ -1230,8 +1230,10 @@ def test_write_run_artifacts_records_sandboxed_false_when_sandbox_off(
 def test_write_run_artifacts_records_sandboxed_false_for_a_non_containerising_adapter(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A non-gemini adapter never containerises, so it must never read as
-    sandboxed even when BENCH_AGENT_SANDBOX is (irrelevantly) set."""
+    """The api adapter drives an in-process tool loop with no CLI subprocess,
+    so it never containerises and must never read as sandboxed even when
+    BENCH_AGENT_SANDBOX is (irrelevantly) set. gemini/claude/openclaw/
+    antigravity are all sandbox-capable now (see sandbox.SANDBOX_CAPABLE_AGENT_TYPES)."""
     from devops_bench.evalharness.reporter import ResultReporter
 
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
@@ -1240,7 +1242,7 @@ def test_write_run_artifacts_records_sandboxed_false_for_a_non_containerising_ad
         project_id="p",
         cluster_name="c",
         reporter=ResultReporter(tmp_path),
-        agent_type="openclaw",
+        agent_type="api",
     )
     run_dir = harness.reporter.new_run_dir()
     harness._write_run_artifacts(run_dir, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001

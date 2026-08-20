@@ -40,14 +40,22 @@ def test_sandbox_state_false_for_capable_adapter_with_env_unset(
     assert sandbox.sandbox_state("gemini") is False
 
 
+def test_sandbox_state_true_for_every_capable_adapter_with_env_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    for agent_type in ("gemini", "claude", "openclaw", "antigravity"):
+        assert sandbox.sandbox_state(agent_type) is True
+
+
 def test_sandbox_state_false_for_incapable_adapter_even_with_env_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Never report True for an adapter that cannot containerise, regardless
-    of what BENCH_AGENT_SANDBOX says: antigravity/openclaw/api never read it."""
+    of what BENCH_AGENT_SANDBOX says: ``api`` drives its tool-use loop
+    in-process and never reads it."""
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
-    for agent_type in ("antigravity", "openclaw", "api"):
-        assert sandbox.sandbox_state(agent_type) is False
+    assert sandbox.sandbox_state("api") is False
 
 
 def test_sandbox_image_none_when_not_sandboxed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,6 +134,24 @@ def test_wrap_argv_emits_bare_dash_e_flag_per_extra_env_key() -> None:
     # bare, not `KEY=value`
     assert "GEMINI_API_KEY=whatever" not in argv
     assert "GEMINI_MODEL=pro" not in argv
+
+
+def test_container_workspace_path_rewrites_nested_path() -> None:
+    workspace = Path("/tmp/ws")
+    assert (
+        sandbox.container_workspace_path(workspace / "state" / "skills", workspace=workspace)
+        == "/workspace/state/skills"
+    )
+
+
+def test_container_workspace_path_rewrites_workspace_itself() -> None:
+    workspace = Path("/tmp/ws")
+    assert sandbox.container_workspace_path(workspace, workspace=workspace) == "/workspace"
+
+
+def test_container_workspace_path_rejects_path_outside_workspace() -> None:
+    with pytest.raises(ValueError):
+        sandbox.container_workspace_path(Path("/tmp/elsewhere"), workspace=Path("/tmp/ws"))
 
 
 def test_wrap_argv_omits_name_flag_when_none_given() -> None:

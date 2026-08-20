@@ -1241,3 +1241,56 @@ def test_execute_uses_distinct_cwd_and_config_dir_per_run(monkeypatch: pytest.Mo
 
     assert len(set(map(str, cwds))) == 2, f"cwds must be unique per run, got {cwds}"
     assert len(set(cfg_dirs)) == 2, f"config dirs must be unique per run, got {cfg_dirs}"
+
+
+# ---------------------------------------------------------------------------
+# Sandbox wiring: BENCH_AGENT_SANDBOX=docker wraps the claude invocation the
+# same way it already does for gemini_cli. See test_sandbox.py for wrap_argv
+# itself and test_agents_cli_gemini.py for the pattern this mirrors.
+# ---------------------------------------------------------------------------
+
+
+def _enable_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "agent-image")
+    monkeypatch.setattr(claude_mod.sandbox, "current_cluster_name", lambda: "kind")
+    monkeypatch.setattr(
+        claude_mod.sandbox,
+        "build_agent_kubeconfig",
+        lambda cluster, dest_dir: dest_dir / "kubeconfig",
+    )
+
+
+def test_execute_sandbox_off_leaves_argv_unwrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    captured: dict = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["argv"] = argv
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
+
+    assert captured["argv"][0] == "claude"
+    assert "docker" not in captured["argv"]
+
+
+def test_execute_sandboxed_run_wraps_argv_in_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_sandbox(monkeypatch)
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    captured: dict = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["argv"] = argv
+        captured["extra_env"] = kwargs.get("extra_env")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    ClaudeCodeAgent(AgentConfig(target="claude", api_key=secret)).run("p")
+
+    assert captured["argv"][0] == "docker"
+    assert secret not in " ".join(captured["argv"])
+    assert captured["extra_env"]["ANTHROPIC_API_KEY"] == secret
+    assert "-e" in captured["argv"]
+    assert "ANTHROPIC_API_KEY" in captured["argv"]

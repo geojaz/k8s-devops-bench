@@ -891,3 +891,80 @@ def test_agy_cli_agent_execute_emits_none_tokens_when_no_source(mock_run, mock_h
 
     assert result.tokens == parsing.empty_tokens()
     assert result.metadata["token_source"] == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Sandbox wiring: BENCH_AGENT_SANDBOX=docker wraps the agy invocation the same
+# way it already does for gemini_cli. See test_sandbox.py for wrap_argv itself
+# and test_agents_cli_claude_code.py for the pattern this mirrors. gcloud
+# lookup calls never pass ``cwd``, so the main agy call is picked out from
+# them by ``kwargs.get("cwd") is not None`` rather than by argv[0].
+# ---------------------------------------------------------------------------
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_sandbox_off_leaves_argv_unwrapped(
+    mock_run, mock_home, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    mock_home.return_value = tmp_path
+    captured: dict = {}
+
+    def side_effect(argv, **kwargs):
+        if kwargs.get("cwd") is None:
+            return SimpleNamespace(args=["gcloud"], returncode=1, stdout="", stderr="")
+        captured["argv"] = argv
+        return SimpleNamespace(args=argv, returncode=0, stdout="", stderr="")
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(target="/bin/agy", capabilities=capabilities.AllCapabilities())
+    agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert captured["argv"][0] == "/bin/agy"
+    assert "docker" not in captured["argv"]
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_sandboxed_run_wraps_argv_and_rewrites_gemini_dir(
+    mock_run, mock_home, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "agent-image")
+    monkeypatch.setattr(agy_mod.sandbox, "current_cluster_name", lambda: "kind")
+    monkeypatch.setattr(
+        agy_mod.sandbox,
+        "build_agent_kubeconfig",
+        lambda cluster, dest_dir: dest_dir / "kubeconfig",
+    )
+    mock_home.return_value = tmp_path
+    secret = "SENTINEL-NOT-A-REAL-KEY-0000"
+    captured: dict = {}
+
+    def side_effect(argv, **kwargs):
+        if kwargs.get("cwd") is None:
+            return SimpleNamespace(args=["gcloud"], returncode=1, stdout="", stderr="")
+        captured["argv"] = argv
+        captured["extra_env"] = kwargs.get("extra_env")
+        return SimpleNamespace(args=argv, returncode=0, stdout="", stderr="")
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy", api_key=secret, capabilities=capabilities.AllCapabilities()
+    )
+    agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert captured["argv"][0] == "docker"
+    assert secret not in " ".join(captured["argv"])
+    assert captured["extra_env"]["GEMINI_API_KEY"] == secret
+    assert "-e" in captured["argv"]
+    assert "GEMINI_API_KEY" in captured["argv"]
+    # --gemini_dir is an absolute HOST path nested under the per-run workdir;
+    # under the sandbox it must be rewritten to its /workspace equivalent, or
+    # the containerised agy process would look for its config at a host path
+    # that does not exist inside the container.
+    gemini_dir_flags = [a for a in captured["argv"] if a.startswith("--gemini_dir=")]
+    assert gemini_dir_flags == ["--gemini_dir=/workspace/.gemini"]

@@ -51,6 +51,7 @@ from the granted bindings, so the agent structurally satisfies
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -60,6 +61,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from devops_bench.agents import sandbox
 from devops_bench.agents.base import AGENTS, AgentHarness
 from devops_bench.agents.cli.openclaw.parsing import (
     _pick_session_key,
@@ -452,27 +454,83 @@ class OpenClawAgent(AgentHarness):
                 env_overlay["OPENCLAW_CONFIG_PATH"] = str(config_path)
 
             command = _build_local_command(self.config, final_prompt, self.agent_name, oc_bin)
+            run_argv: list[str] = ["/bin/bash", "-c", command]
+
+            # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker.
+            # Mirrors gemini_cli/agent.py: everything above still runs on the
+            # host (state/, the skills tree, openclaw.json are written into
+            # `workdir`, mounted into the container as /workspace); only the
+            # agent turn itself moves. Only the turn: the `oc sessions` /
+            # `export-trajectory` extraction below stays a direct host
+            # subprocess call, since it only reads the session state the turn
+            # already wrote into the (host-visible) workdir, and needs no
+            # containment of its own.
+            #
+            # `OPENCLAW_STATE_DIR`/`OPENCLAW_CONFIG_PATH` are absolute HOST
+            # paths under `workdir`; unlike gemini/claude (which discover their
+            # config relative to the CWD wrap_argv sets to /workspace), oc
+            # reads these from the env verbatim, so a sandboxed run needs its
+            # own copy of the overlay with those two rewritten to their
+            # /workspace-relative equivalents. `env_overlay` itself (host
+            # paths) is left untouched for the extraction calls below.
+            container_name: str | None = None
+            if sandbox.sandbox_enabled():
+                sandboxed_env = dict(env_overlay)
+                for key in ("OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"):
+                    if key in sandboxed_env:
+                        sandboxed_env[key] = sandbox.container_workspace_path(
+                            Path(sandboxed_env[key]), workspace=workdir
+                        )
+                cluster = sandbox.current_cluster_name()
+                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir) if cluster else None
+                if kubeconfig is None:
+                    # Refuse rather than silently running unsandboxed on the
+                    # host: a containment control that quietly degrades is
+                    # worse than none.
+                    return AgentResult.errored(
+                        "BENCH_AGENT_SANDBOX is set but no sandbox kubeconfig could be "
+                        "built; refusing to fall back to an unsandboxed run"
+                    )
+                container_name = sandbox.container_name_for_workspace(workdir)
+                run_argv = sandbox.wrap_argv(
+                    run_argv,
+                    workspace=workdir,
+                    kubeconfig=kubeconfig,
+                    extra_env=sandboxed_env,
+                    container_name=container_name,
+                )
+                run_env_overlay = sandboxed_env
+            else:
+                run_env_overlay = env_overlay
 
             # TODO(follow-up): on timeout this SIGKILLs only the bash child,
             # orphaning the oc/gcloud/kubectl/MCP process tree (which keeps
             # consuming Vertex quota). Run in its own process group
             # (start_new_session=True) and os.killpg(...) on timeout. Tracked as a
             # separate, more intrusive change to generalize across all CLI agents.
-            try:
-                # bash -c (as argv, never shell=True) so nvm.sh can be sourced;
-                # every value interpolated into `command` is shlex.quoted.
-                completed = run(
-                    ["/bin/bash", "-c", command],
-                    cwd=str(workdir),
-                    extra_env=env_overlay,
-                    check=False,
-                    timeout=self.config.timeout_sec,
-                )
-            except SubprocessError:
-                # With check=False the only SubprocessError here is a timeout.
-                return AgentResult.errored(f"oc agent timed out after {self.config.timeout_sec}s")
-            except OSError as exc:
-                return AgentResult.errored(f"oc binary unavailable: {exc}")
+            guard = (
+                sandbox.container_guard(container_name)
+                if container_name is not None
+                else contextlib.nullcontext()
+            )
+            with guard:
+                try:
+                    # bash -c (as argv, never shell=True) so nvm.sh can be sourced;
+                    # every value interpolated into `command` is shlex.quoted.
+                    completed = run(
+                        run_argv,
+                        cwd=str(workdir),
+                        extra_env=run_env_overlay,
+                        check=False,
+                        timeout=self.config.timeout_sec,
+                    )
+                except SubprocessError:
+                    # With check=False the only SubprocessError here is a timeout.
+                    return AgentResult.errored(
+                        f"oc agent timed out after {self.config.timeout_sec}s"
+                    )
+                except OSError as exc:
+                    return AgentResult.errored(f"oc binary unavailable: {exc}")
 
             stdout_text = _strip_ansi(completed.stdout or "")
             errors: list[str] = []
