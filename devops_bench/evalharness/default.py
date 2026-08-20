@@ -1452,6 +1452,12 @@ class DefaultEvalHarness(Harness):
             "skills": list(self._granted_skill_paths),
             "name": task.name,
             "folder": task.folder,
+            # Traces this record back to the exact task revision it ran
+            # against: the generator's declared version (None on specs
+            # written before this field existed) and a content hash of the
+            # raw task.yaml bytes the loader actually parsed.
+            "task_version": task.task_version,
+            "task_yaml_sha256": task.task_yaml_sha256,
             "status": "",
             "error": None,
             "errors": [],

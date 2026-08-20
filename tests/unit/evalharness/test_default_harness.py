@@ -909,6 +909,8 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "skills",
         "name",
         "folder",
+        "task_version",
+        "task_yaml_sha256",
         "status",
         "error",
         "errors",
@@ -989,6 +991,8 @@ def test_success_record_keys_match_golden(isolated_env: None) -> None:
     assert record["error"] is None
     assert record["errors"] == []
     assert record["scores"] == {}
+    assert record["task_version"] is None
+    assert record["task_yaml_sha256"] == ""
 
 
 def test_failed_record_keys_match_golden(isolated_env: None) -> None:
